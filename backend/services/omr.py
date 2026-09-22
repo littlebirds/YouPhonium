@@ -6,6 +6,7 @@ then HOMR, then oemer as fallback.
 """
 
 import logging
+import json
 import os
 import signal
 
@@ -20,6 +21,10 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 from .omr_layout import parse_omr_layout, parse_omr_note_positions
+from .recognition_quality import analyze_musicxml, quality_cost, read_musicxml
+from .score_image import prepare_score_image, load_score_image
+from .audiveris_recovery import prepare_wedge_recovery
+from .source_layout import preserve_source_layout
 
 AUDIVERIS_NAMES = ("audiveris", "Audiveris")
 
@@ -58,6 +63,19 @@ def _pdf_to_images(pdf_path: Path, output_dir: Path) -> List[Path]:
     doc.close()
     log.info("[OMR] PDF converted to %d PNG(s): %s", len(images), [str(p.name) for p in images])
     return images
+
+
+def _upscale_image_for_audiveris(
+    image_path: Path, output_path: Path, scale: float = 2.0
+) -> Path:
+    """Upscale a low-resolution score image before retrying Audiveris."""
+    from PIL import Image
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image = load_score_image(image_path)
+    image = image.resize((round(image.width * scale), round(image.height * scale)),
+                         Image.Resampling.LANCZOS)
+    image.save(output_path, dpi=(300, 300))
+    return output_path
 
 
 OMR_PAGE_TIMEOUT = 600  # 10 min per page
@@ -339,25 +357,21 @@ def _run_homr_on_image(img_path: Path) -> Path:
     log.info("[OMR] Running homr on %s", img_path.name)
     # homr has no __main__; use the CLI script (homr.main:main) from pip
     bin_dir = Path(sys.executable).parent
-    homr_cmd = shutil.which("homr")
-    if homr_cmd is None:
-        for name in ("homr", "homr.exe"):
-            p = bin_dir / name
-            if p.exists():
-                homr_cmd = str(p)
-                break
+    homr_cmd = next((str(bin_dir / name) for name in ("homr", "homr.exe")
+                     if (bin_dir / name).exists()), None) or shutil.which("homr")
     if homr_cmd is None:
         raise RuntimeError(
             "homr CLI not found. Install with: pip install homr "
             "(script should be in same dir as python)"
         )
-    result = subprocess.run(
-        [homr_cmd, str(img_path)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        env=_OMR_ENV,
-    )
+    try:
+        result = subprocess.run(
+            [homr_cmd, str(img_path)], capture_output=True, text=True,
+            timeout=OMR_PAGE_TIMEOUT, env=_OMR_ENV,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"HOMR exceeded {OMR_PAGE_TIMEOUT // 60} minutes for this page. "
+                           "First use may require downloading model weights; check the server's network access.") from exc
     if result.returncode != 0:
         err_parts = []
         if result.stderr and result.stderr.strip():
@@ -375,9 +389,6 @@ def _run_homr_on_image(img_path: Path) -> Path:
     mxl_path = img_path.with_suffix(".mxl")
     if mxl_path.exists():
         return mxl_path
-    candidates = list(img_path.parent.glob("*.musicxml")) + list(img_path.parent.glob("*.mxl"))
-    if candidates:
-        return candidates[0]
     raise RuntimeError(f"homr did not produce MusicXML. Output: {list(img_path.parent.iterdir())}")
 
 
@@ -435,6 +446,8 @@ def run_omr_homr_from_images(
         raise RuntimeError("No images provided")
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    inputs_dir = output_dir / "inputs"
+    inputs_dir.mkdir(exist_ok=True)
     total = len(image_paths)
     musicxml_paths = []
     for i, img_path in enumerate(image_paths):
@@ -442,8 +455,13 @@ def run_omr_homr_from_images(
         if i == 0:
             msg += " (HOMR model load: 1–2 min on first page)"
         _progress(msg)
+        # HOMR writes beside its input. Use a job-private copy so it cannot
+        # overwrite the upload, pick up another job's result, or leave files
+        # in the user's source directory.
+        private_input = inputs_dir / f"page_{i:04d}.png"
+        load_score_image(img_path).save(private_input)
         with _omr_lock:
-            mxl = _run_homr_on_image(img_path)
+            mxl = _run_homr_on_image(private_input)
         musicxml_paths.append(mxl)
 
     _progress("Merging pages…")
@@ -453,16 +471,17 @@ def run_omr_homr_from_images(
 
 
 def run_omr(
-    pdf_path: Path,
+    input_path: Path,
     output_dir: Path,
     on_progress: Optional[Callable[[str], None]] = None,
+    constants: Optional[List[str]] = None,
 ) -> Path:
     """
-    Run Audiveris OMR on a PDF file.
+    Run Audiveris OMR on a PDF or image file.
     Uses -batch -export (transcribe + export in one command).
 
     Args:
-        pdf_path: Path to the input PDF
+        input_path: Path to the input PDF or image
         output_dir: Directory for Audiveris output
         on_progress: Optional callback for progress messages
 
@@ -486,15 +505,12 @@ def run_omr(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # CLI constants: match GUI settings not saved in run.properties (compiled-in defaults
-    # that the GUI shows but doesn't write to file unless explicitly overridden).
-    # BlackHeadSizer.minHeight=1.2: match GUI default; ensures small noteheads are recognized.
-    _CLI_CONSTANTS = [
-        "org.audiveris.omr.sheet.beam.BlackHeadSizer.minHeight=1.2",
-    ]
+    # Do not override BlackHeadSizer.minHeight: 1.2 was not the installed
+    # Audiveris default (0.9) and discards valid calibration samples.
+    _CLI_CONSTANTS = constants or []
 
     _progress("Running Audiveris (transcribe + export)…")
-    log.info("[OMR] Audiveris batch export: %s", pdf_path.name)
+    log.info("[OMR] Audiveris batch export: %s", input_path.name)
     env = os.environ.copy()
     env.setdefault("JAVA_TOOL_OPTIONS", "-Djava.awt.headless=true")
 
@@ -512,9 +528,9 @@ def run_omr(
         "-export",
         "-output",
         str(output_dir),
-        "-option",
+        "-constant",
         "org.audiveris.omr.sheet.BookManager.useSeparateBookFolders=false",
-        str(pdf_path),
+        str(input_path),
     ]
     result = subprocess.run(
         export_cmd,
@@ -523,26 +539,26 @@ def run_omr(
         timeout=300,  # 5 min for complex PDFs
         env=env,
     )
+    processing_output = (result.stdout or "") + "\n" + (result.stderr or "")
+    (output_dir / "audiveris.log").write_text(processing_output, encoding="utf-8")
     if result.returncode != 0:
-        err = (result.stderr or "").strip() or (result.stdout or "").strip() or "Unknown error"
-        log.error("[OMR] Audiveris failed: %s", err)
+        # Audiveris writes its useful processing diagnostics to stdout, while
+        # Java may put only a generic JAVA_TOOL_OPTIONS notice on stderr.
+        # Preserve both streams so callers can identify retryable failures.
+        output = "\n".join(
+            part for part in ((result.stdout or "").strip(), (result.stderr or "").strip()) if part
+        ) or "Unknown error"
+        log.error("[OMR] Audiveris failed: %s", output)
+        output_tail = "\n".join(output.splitlines()[-80:])
         raise RuntimeError(
-            f"Audiveris failed (exit code {result.returncode}): {err}"
+            f"Audiveris failed (exit code {result.returncode}): {output_tail}"
         )
 
     def _is_musicxml(path: Path) -> bool:
         """Check that file is actually MusicXML (not e.g. plist)."""
         try:
-            if path.suffix.lower() == ".mxl":
-                with zipfile.ZipFile(path, "r") as zf:
-                    for name in zf.namelist():
-                        if name.endswith(".xml"):
-                            sample = zf.read(name)[:4096].decode("utf-8", errors="ignore")
-                            return "score-partwise" in sample or "score-timewise" in sample
-                return False
-            data = path.read_bytes()
-            sample = data[:4096].decode("utf-8", errors="ignore")
-            return "score-partwise" in sample or "score-timewise" in sample
+            read_musicxml(path)
+            return True
         except Exception:
             return False
 
@@ -552,7 +568,7 @@ def run_omr(
             return []
         valid = []
         for f in search_dir.rglob("*"):
-            if f.is_file() and f.suffix.lower() in (".mxl", ".xml") and _is_musicxml(f):
+            if f.is_file() and f.suffix.lower() in (".mxl", ".xml", ".musicxml") and _is_musicxml(f):
                 valid.append(f)
         # Sort by name so mvt1, mvt2, ... are in order
         valid.sort(key=lambda p: p.name)
@@ -560,6 +576,35 @@ def run_omr(
 
     # With useSeparateBookFolders=false: output_dir/stem.mxl or output_dir/stem.mvt1.mxl, etc.
     mxl_files = _find_all_musicxml(output_dir)
+    # 5.11 can exit 0 while dropping a whole measure: WedgeIterators sorts
+    # crescendo endpoints with null rhythmic offsets. Retry export of a COPY,
+    # dropping only affected expression marks, never notes or their durations.
+    if "WedgeIterators" in processing_output and "timeOffset\" is null" in processing_output:
+        for project in output_dir.glob("*.omr"):
+            recovery_dir = output_dir / "recovery"
+            recovered_project = recovery_dir / project.name
+            removed = prepare_wedge_recovery(project, recovered_project)
+            if not removed:
+                continue
+            _progress("Recovering an incomplete Audiveris export…")
+            recovery = subprocess.run(
+                [audiveris, "-batch", "-export", "-output", str(recovery_dir),
+                 "-constant", "org.audiveris.omr.sheet.BookManager.useSeparateBookFolders=false",
+                 str(recovered_project)], capture_output=True, text=True, timeout=120, env=env,
+            )
+            (recovery_dir / "audiveris.log").write_text(
+                (recovery.stdout or "") + "\n" + (recovery.stderr or ""), encoding="utf-8")
+            recovered = _find_all_musicxml(recovery_dir)
+            if recovery.returncode == 0 and recovered:
+                old_cost = sum(quality_cost(analyze_musicxml(p)) for p in mxl_files) if mxl_files else float("inf")
+                new_cost = sum(quality_cost(analyze_musicxml(p)) for p in recovered)
+                if new_cost <= old_cost:
+                    mxl_files = recovered
+                    for path in recovered:
+                        path.with_suffix(".diagnostics.json").write_text(json.dumps({"export_warnings": [
+                            f"Omitted {removed} crescendo/diminuendo marking(s) with invalid timing to recover Audiveris's incomplete export. Review the original project."
+                        ]}), encoding="utf-8")
+            break
     if not mxl_files:
         # Fallback: Audiveris may have produced .omr (project file) but not .mxl.
         # Run a second pass to export from the .omr file.
@@ -576,7 +621,7 @@ def run_omr(
                     "-export",
                     "-output",
                     str(output_dir),
-                    "-option",
+                    "-constant",
                     "org.audiveris.omr.sheet.BookManager.useSeparateBookFolders=false",
                     str(omr_path),
                 ],
@@ -615,9 +660,80 @@ def run_omr(
     # Multiple movements (mvt1, mvt2, ...): merge into one
     _progress("Merging movements…")
     log.info("[OMR] Merging %d movement file(s)", len(mxl_files))
-    merged_path = output_dir / f"{pdf_path.stem}_merged.musicxml"
+    merged_path = output_dir / f"{input_path.stem}_merged.musicxml"
     _merge_musicxml(mxl_files, merged_path)
     return merged_path
+
+
+def _audiveris_image(image_path: Path, work_dir: Path, on_progress=None) -> Path:
+    """At most two recognition passes; choose by structural checks, not note count."""
+    candidates = []
+    errors = []
+    retry_low_resolution = False
+    for alternate in (False, True):
+        label = "alternate" if alternate else "standard"
+        candidate_dir = work_dir / label
+        prepared = candidate_dir / "score.png"
+        preparation = prepare_score_image(image_path, prepared, alternate=alternate)
+        if alternate and retry_low_resolution and preparation["scale"] == 1:
+            _upscale_image_for_audiveris(image_path, prepared)
+            preparation.update(scale=2, width=preparation["width"] * 2,
+                               height=preparation["height"] * 2)
+        constants = []
+        if alternate:
+            # Alternate templates and vertical tolerance help hollow heads in
+            # small, antialiased screenshots. Never impose this on clean PDFs.
+            constants = [
+                "org.audiveris.omr.ui.symbol.MusicFont.defaultMusicFamily=Primus",
+                "org.audiveris.omr.sheet.note.NoteHeadsBuilder.maxClosedDy=0.2",
+                "org.audiveris.omr.sheet.note.NoteHeadsBuilder.stemLessBoost=0.15",
+            ]
+        if on_progress:
+            on_progress(f"Recognizing image ({label} pass, {preparation['scale']:g}× scale)…")
+        try:
+            path = run_omr(prepared, candidate_dir, on_progress, constants=constants)
+            report = analyze_musicxml(path)
+            candidates.append((quality_cost(report), path, preparation, label))
+            if not report["issues"]:
+                break
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            errors.append(str(exc))
+            retry_low_resolution = any(message in str(exc).lower()
+                                       for message in ("too low interline", "resolution is too low"))
+            log.warning("[OMR] %s image pass failed: %s", label, exc)
+    if not candidates:
+        raise RuntimeError("Audiveris image recognition failed: " + "\n".join(errors))
+    _, selected, preparation, label = min(candidates, key=lambda item: item[0])
+    metadata_path = selected.with_suffix(".diagnostics.json")
+    metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
+    metadata.update({"selected_pass": label, "preparation": preparation,
+                     "candidates": [{"pass": name, "structural_cost": cost}
+                                    for cost, _, _, name in candidates]})
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    return selected
+
+
+def _save_recognition_report(source: Path, destination: Path) -> None:
+    projects = list(source.parent.glob("*.omr"))
+    source_layout = preserve_source_layout(destination, projects[0]) if projects else None
+    report = analyze_musicxml(destination)
+    diagnostics = source.with_suffix(".diagnostics.json")
+    if diagnostics.exists():
+        report.update(json.loads(diagnostics.read_text(encoding="utf-8")))
+    if source_layout is not None:
+        report["source_layout"] = source_layout
+    destination.with_suffix(".recognition.json").write_text(
+        json.dumps(report, indent=2), encoding="utf-8")
+    # Retain the editable recognition project, including the pre-recovery
+    # original when an expression-mark export workaround was necessary.
+    if projects:
+        shutil.copy2(projects[0], destination.with_suffix(".omr"))
+    if (source.parent / "audiveris.log").exists():
+        shutil.copy2(source.parent / "audiveris.log", destination.with_suffix(".audiveris.log"))
+    if source.parent.name == "recovery":
+        originals = list(source.parent.parent.glob("*.omr"))
+        if originals:
+            shutil.copy2(originals[0], destination.with_suffix(".original.omr"))
 
 
 def pdf_to_musicxml(
@@ -697,6 +813,7 @@ def pdf_to_musicxml(
         suffix = musicxml_path.suffix
         persistent = output_dir / f"{stem}{suffix}"
         shutil.copy(musicxml_path, persistent)
+        _save_recognition_report(musicxml_path, persistent)
         persistent.touch()  # Update mtime to now so file date reflects this run
         log.info("[OMR] MusicXML saved to: %s", persistent.resolve())
 
@@ -704,7 +821,7 @@ def pdf_to_musicxml(
         omr_layout = None
         omr_note_positions = None
         if use_audiveris:
-            omr_paths = list(out_dir.glob("*.omr"))
+            omr_paths = list(musicxml_path.parent.glob("*.omr"))
             if omr_paths:
                 omr_layout = parse_omr_layout(omr_paths[0])
                 omr_note_positions = parse_omr_note_positions(omr_paths[0])
@@ -722,20 +839,16 @@ def image_to_musicxml(
     original_filename: Optional[str] = None,
     on_progress: Optional[Callable[[str], None]] = None,
     engine: Optional[str] = None,
-) -> Tuple[Path, Optional[List[dict]]]:
+) -> Tuple[Path, Optional[List[dict]], Optional[List[List[dict]]]]:
     """
-    Convert image (PNG, JPG) to MusicXML using HOMR or oemer.
-    Audiveris only supports PDF; use HOMR or oemer for images.
-    Returns (path, None) - no .omr layout for image engines.
+    Convert image (PNG, JPG) to MusicXML using Audiveris, HOMR, or oemer.
+
+    Returns (path, omr_layout, omr_note_positions). Layout data is available
+    when Audiveris produces an .omr project; other engines return None values.
     """
     def _progress(msg: str) -> None:
         if on_progress:
             on_progress(msg)
-
-    if engine == "audiveris":
-        raise RuntimeError(
-            "Audiveris only supports PDF files. Use HOMR or oemer for image files (PNG, JPG)."
-        )
 
     project_root = Path(__file__).resolve().parent.parent.parent
     output_dir = project_root / "omr_output"
@@ -747,10 +860,22 @@ def image_to_musicxml(
         musicxml_path = None
         image_paths = [image_path]
 
-        use_homr = engine == "homr" or (engine is None and find_homr())
-        use_oemer = engine == "oemer" or (engine is None and not find_homr() and find_oemer())
+        use_audiveris = engine == "audiveris" or (engine is None and find_audiveris())
+        use_homr = engine == "homr" or (
+            engine is None and not find_audiveris() and find_homr()
+        )
+        use_oemer = engine == "oemer" or (
+            engine is None and not find_audiveris() and not find_homr() and find_oemer()
+        )
 
-        if use_homr and find_homr():
+        if use_audiveris and find_audiveris():
+            if engine is None:
+                log.info("[OMR] Auto: using Audiveris for %s", image_path.name)
+            _progress("Running Audiveris OMR…")
+            log.info("[OMR] Using Audiveris for %s", image_path.name)
+            with _omr_lock:
+                musicxml_path = _audiveris_image(image_path, out_dir, on_progress)
+        elif use_homr and find_homr():
             _progress("Running HOMR OMR…")
             log.info("[OMR] Using HOMR for %s", image_path.name)
             musicxml_path = run_omr_homr_from_images(
@@ -764,6 +889,10 @@ def image_to_musicxml(
             musicxml_path = run_omr_from_images(
                 image_paths, out_dir, stem=stem, on_progress=on_progress
             )
+        elif engine == "audiveris" and not find_audiveris():
+            raise RuntimeError(
+                "Audiveris not found. Install from https://audiveris.com/ and add to PATH."
+            )
         elif (engine == "homr" or use_homr) and not find_homr():
             raise RuntimeError("HOMR not found. Install with: pip install homr")
         elif (engine == "oemer" or use_oemer) and not find_oemer():
@@ -772,12 +901,22 @@ def image_to_musicxml(
             )
         else:
             raise RuntimeError(
-                "No OMR engine found for images. Install HOMR (pip install homr) or "
-                "oemer (./install_oemer.sh). Audiveris only supports PDF."
+                "No OMR engine found for images. Install Audiveris (https://audiveris.com/), "
+                "HOMR (pip install homr), or oemer (./install_oemer.sh)."
             )
 
         suffix = musicxml_path.suffix
         persistent = output_dir / f"{stem}{suffix}"
         shutil.copy2(musicxml_path, persistent)
+        _save_recognition_report(musicxml_path, persistent)
         log.info("[OMR] MusicXML saved to: %s", persistent.resolve())
-        return (persistent, None, None)
+
+        omr_layout = None
+        omr_note_positions = None
+        if use_audiveris:
+            omr_paths = list(musicxml_path.parent.glob("*.omr"))
+            if omr_paths:
+                omr_layout = parse_omr_layout(omr_paths[0])
+                omr_note_positions = parse_omr_note_positions(omr_paths[0])
+
+        return (persistent, omr_layout, omr_note_positions)

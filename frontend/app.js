@@ -1,11 +1,6 @@
 (function () {
   "use strict";
 
-  if (typeof pdfjsLib !== "undefined") {
-    pdfjsLib.GlobalWorkerOptions.workerSrc =
-      "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
-  }
-
   const API_URL = (window.location.protocol === "file:" || !window.location.origin || window.location.origin === "null")
     ? "http://localhost:8000"
     : "";
@@ -13,11 +8,12 @@
   const dropzone = document.getElementById("dropzone");
   const fileInput = document.getElementById("fileInput");
   const browseBtn = document.getElementById("browseBtn");
-  const uploadSection = document.getElementById("uploadSection");
   const statusSection = document.getElementById("statusSection");
   const statusEl = document.getElementById("status");
   const playerSection = document.getElementById("playerSection");
   const trackNameEl = document.getElementById("trackName");
+  const recognitionEngineEl = document.getElementById("recognitionEngine");
+  const ENGINE_LABELS = { audiveris: "Audiveris", homr: "HOMR", oemer: "oemer" };
   const playBtn = document.getElementById("playBtn");
   const pauseBtn = document.getElementById("pauseBtn");
   const stopBtn = document.getElementById("stopBtn");
@@ -28,17 +24,11 @@
   const errorSection = document.getElementById("errorSection");
   const errorBox = document.getElementById("errorBox");
   const notationSection = document.getElementById("notationSection");
-  const pdfCanvas = document.getElementById("pdfCanvas");
-  const pdfContainer = document.getElementById("pdfContainer");
   const verovioNotation = document.getElementById("verovioNotation");
-  const notationWrapper = document.getElementById("notationWrapper");
-  const layoutSection = document.getElementById("layoutSection");
-  const measuresPerLineSelect = document.getElementById("measuresPerLineSelect");
   const notationTitle = document.getElementById("notationTitle");
   const playlistSection = document.getElementById("playlistSection");
   const playlistEl = document.getElementById("playlist");
   const mainPlaceholder = document.getElementById("mainPlaceholder");
-  const practiceSection = document.getElementById("practiceSection");
   const practiceHint = document.getElementById("practiceHint");
   const recordBtn = document.getElementById("recordBtn");
   const stopRecordBtn = document.getElementById("stopRecordBtn");
@@ -51,14 +41,13 @@
   const prevPageBtn = document.getElementById("prevPageBtn");
   const nextPageBtn = document.getElementById("nextPageBtn");
   const pageNavText = document.getElementById("pageNavText");
-  const engineSelector = document.getElementById("engineSelector");
-  const omrEngineSelect = document.getElementById("omrEngine");
-  const viewToggle = document.getElementById("viewToggle");
-  const viewPdfBtn = document.getElementById("viewPdfBtn");
-  const viewNotationBtn = document.getElementById("viewNotationBtn");
-  const pdfOverlay = document.getElementById("pdfOverlay");
   const measureHighlight = document.getElementById("measureHighlight");
+  const playbackCursor = document.getElementById("playbackCursor");
   const notationViewport = document.getElementById("notationViewport");
+  const recognitionReview = document.getElementById("recognitionReview");
+  let musicxmlBlobUrl = null;
+  const musicxmlDownload = document.getElementById("musicxmlDownload");
+  const notationMessage = document.getElementById("notationMessage");
 
   const MAX_PLAYLIST_SIZE = 20;
   let playlist = [];
@@ -80,10 +69,9 @@
   let verovioTk = null;
   let verovioReady = null;
   let currentNotationPage = 1;
-  let pdfBlobUrl = null;
-  let pdfDoc = null;
   let hasVerovioScore = false;
-  let viewMode = "pdf";  /* "pdf" | "notation" - PDF preferred, notation has playback highlight */
+  let playbackHighlightVisible = false;
+  let followedSystem = null;
   let practiceComparison = null;
   let noteIdMap = null;
   let mediaRecorder = null;
@@ -101,478 +89,57 @@
         })
       : Promise.resolve();
 
-  function loadPdfAndGetDimensions(blobUrl) {
-    if (!blobUrl || typeof pdfjsLib === "undefined") return Promise.resolve({ dims: null });
-    return pdfjsLib
-      .getDocument(blobUrl)
-      .promise.then(function (pdf) {
-        pdfDoc = pdf;
-        return pdf.getPage(1);
-      })
-      .then(function (page) {
-        var vp = page.getViewport({ scale: 1 });
-        return { dims: { width: Math.round(vp.width), height: Math.round(vp.height) } };
-      })
-      .catch(function () {
-        pdfDoc = null;  /* e.g. PNG file, not a PDF */
-        return { dims: null };
-      });
-  }
-
-  var PDF_DISPLAY_SCALE = 1.5;
-  var measuresPerLineMultiplier = 3;
-
-  /* Match Verovio page width to PDF content area at display scale */
-  var PDF_CONTENT_WIDTH_FACTOR = 0.86;
-  /* Verovio tends to fit ~half the expected measures; scale up to match original layout */
-  var LAYOUT_PAGE_WIDTH_FACTOR = 2;
-  var currentTrackForLayout = null;
-  var currentPdfMeasureRect = null;
-  var overlaySeekDragging = false;
-  var restRunAnchorMeasureIdx = null;
-  var restRunSpanLength = 0;   /* measures in current rest span (capped by layout offset) */
-  var cumulativeRestOffset = 0; /* sum of (span-1) for all completed rest spans */
-
-  function applyVerovioLayout() {
-    if (!verovioTk) return;
-    var track = currentTrackForLayout;
-    var n = Math.max(1, Math.min(10, measuresPerLineMultiplier));
-    var baseW = 2100;
-    var baseN = n;
-    if (track && track.layoutParams) {
-      baseW = track.layoutParams.pageWidthVerovio;
-      baseN = track.layoutParams.measuresPerLineForPageWidth;
-    }
-    var pageW = Math.round(baseW * (n / Math.max(1, baseN)));
-    try {
-      verovioTk.setOptions({
-        pageWidth: pageW,
-        scale: 100,
-        adjustPageWidth: false,
-        condense: "auto",
-        spacingNonLinear: 1,
-        spacingLinear: 0.03,
-      });
-    } catch (e) {
-      verovioTk.setOptions({
-        pageWidth: pageW,
-        scale: 100,
-        adjustPageWidth: false,
-      });
-    }
-    if (typeof verovioTk.redoLayout === "function") {
-      verovioTk.redoLayout();
-    }
-  }
-
-  function renderPdfPage(pageNum, onRendered) {
-    if (!pdfDoc || !pdfCanvas) return;
-    pdfDoc.getPage(pageNum).then(function (page) {
-      // Fit the full page to the available wrapper width (wrapper padding = 40px total).
-      var naturalVp = page.getViewport({ scale: 1 });
-      var availableW = (notationWrapper ? notationWrapper.clientWidth : 0) - 40;
-      if (availableW < 100) availableW = 760; // fallback before layout is complete
-      PDF_DISPLAY_SCALE = Math.max(0.3, availableW / naturalVp.width);
-      var viewport = page.getViewport({ scale: PDF_DISPLAY_SCALE });
-      var ctx = pdfCanvas.getContext("2d");
-      pdfCanvas.height = viewport.height;
-      pdfCanvas.width = viewport.width;
-      var renderTask = page.render({
-        canvasContext: ctx,
-        viewport: viewport,
-      });
-      function done() {
-        if (viewMode === "pdf" && pdfOverlay) {
-          requestAnimationFrame(function () { drawPdfOverlay(); });
-        }
-        if (onRendered) requestAnimationFrame(onRendered);
-      }
-      if (renderTask && renderTask.promise) {
-        renderTask.promise.then(done);
-      } else {
-        done();
-      }
+  let uploadBusy = false;
+  let trackLoading = false;
+  function setUploadControlsDisabled(disabled) {
+    [browseBtn, fileInput].forEach(function (control) {
+      if (control) control.disabled = disabled;
     });
   }
 
-  function drawPdfOverlay() {
-    if (!pdfOverlay || !pdfCanvas || pdfOverlay.getContext === undefined) return;
-    var w = pdfCanvas.offsetWidth || pdfCanvas.width;
-    var h = pdfCanvas.offsetHeight || pdfCanvas.height;
-    if (w <= 0 || h <= 0) return;
-    pdfOverlay.width = w;
-    pdfOverlay.height = h;
-    pdfOverlay.style.width = w + "px";
-    pdfOverlay.style.height = h + "px";
-    var ctx = pdfOverlay.getContext("2d");
-    ctx.clearRect(0, 0, w, h);
-    currentPdfMeasureRect = null;
-    if (totalDuration <= 0) return;
+  var currentTrackForLayout = null;
+
+  function applyVerovioLayout(relayout) {
+    if (!verovioTk) return;
     var track = currentTrackForLayout;
-    var boundaries = track && track.measureBoundaries ? track.measureBoundaries : [];
-    var layoutPositions = track && track.measureLayoutPositions ? track.measureLayoutPositions : [];
-    var notePositions = track && track.measureNotePositions ? track.measureNotePositions : [];
-
-    var currentMeasureIdx = -1;
-    for (var i = 0; i < boundaries.length; i++) {
-      if (playhead >= boundaries[i][0] && playhead < boundaries[i][1]) {
-        currentMeasureIdx = i;
-        break;
+    var sourceLayout = track && track.recognitionReport && track.recognitionReport.source_layout;
+    var pageW = 2100;
+    var pageH = 2970;
+    if (sourceLayout && sourceLayout.pages && sourceLayout.pages.length) {
+      var sourcePage = sourceLayout.pages[0];
+      if (sourcePage.width > 0 && sourcePage.height > 0) {
+        pageH = Math.max(100, Math.min(60000, Math.round(pageW * sourcePage.height / sourcePage.width)));
       }
     }
-    if (currentMeasureIdx < 0) return;
-    var measureHasOnsetAt = function (mi) {
-      if (!boundaries || mi < 0 || mi >= boundaries.length) return false;
-      var bs = boundaries[mi][0], be = boundaries[mi][1];
-      for (var k = 0; k < notes.length; k++) {
-        var ntt = notes[k];
-        if (ntt.time >= be) break;
-        if (ntt.time >= bs && ntt.time < be) return true;
-      }
-      return false;
-    };
-    var firstRestAt = function (mi) {
-      if (!notePositions || mi < 0 || mi >= notePositions.length) return null;
-      var list = notePositions[mi] || [];
-      for (var k = 0; k < list.length; k++) {
-        if (list[k] && list[k].rest) return list[k];
-      }
-      return null;
-    };
-    var measureFromOnset = function (onsetSec) {
-      if (!boundaries || onsetSec == null) return -1;
-      for (var bi = 0; bi < boundaries.length; bi++) {
-        if (onsetSec >= boundaries[bi][0] && onsetSec < boundaries[bi][1]) return bi;
-      }
-      return -1;
-    };
-    var soundingNoteMeasureIdx = -1;
-    for (var ni = 0; ni < notes.length; ni++) {
-      var sn = notes[ni];
-      if (sn.time > playhead) break;
-      if (playhead >= sn.time && playhead < sn.time + sn.duration) {
-        soundingNoteMeasureIdx = measureFromOnset(sn.time);
-      }
-    }
-    // Remap MIDI measure index → visual (OMR) measure index, accounting for multi-measure rests.
-    // Audiveris collapses each N-measure rest into ONE visual measure; music21 expands it into N.
-    // layoutOffset = total phantom measures accumulated across ALL rests so far.
-    // cumulativeRestOffset tracks how much offset has been consumed by completed rests.
-    // restRunSpanLength is capped by the remaining layout offset to avoid counting regular rests
-    // (e.g. a half-note rest in the measure immediately after a multi-measure rest) as part of
-    // the multi-measure rest span.
-    var totalLayoutOffset = Math.max(0, boundaries.length - layoutPositions.length);
-
-    var drawMeasureIdx = currentMeasureIdx;
-    if (soundingNoteMeasureIdx >= 0) {
-      // Notes are sounding.  Finalize any pending rest span and apply cumulative offset.
-      if (restRunAnchorMeasureIdx != null &&
-          soundingNoteMeasureIdx >= restRunAnchorMeasureIdx + restRunSpanLength) {
-        cumulativeRestOffset += restRunSpanLength - 1;
-        restRunAnchorMeasureIdx = null;
-        restRunSpanLength = 0;
-      } else if (restRunAnchorMeasureIdx != null) {
-        cumulativeRestOffset += restRunSpanLength - 1;
-        restRunAnchorMeasureIdx = null;
-        restRunSpanLength = 0;
-      }
-      drawMeasureIdx = Math.max(0, soundingNoteMeasureIdx - cumulativeRestOffset);
-    } else if (measureHasOnsetAt(currentMeasureIdx)) {
-      // No note sounding but the current measure has onsets – exit any pending rest span.
-      if (restRunAnchorMeasureIdx != null) {
-        cumulativeRestOffset += restRunSpanLength - 1;
-        restRunAnchorMeasureIdx = null;
-        restRunSpanLength = 0;
-      }
-      drawMeasureIdx = Math.max(0, currentMeasureIdx - cumulativeRestOffset);
-    } else {
-      // In a no-onset region.  Detect when the PREVIOUS rest span is now behind us and start fresh.
-      var pastCurrentSpan = restRunAnchorMeasureIdx != null &&
-        currentMeasureIdx >= restRunAnchorMeasureIdx + restRunSpanLength;
-      if (pastCurrentSpan) {
-        cumulativeRestOffset += restRunSpanLength - 1;
-        restRunAnchorMeasureIdx = null;
-        restRunSpanLength = 0;
-      }
-      if (restRunAnchorMeasureIdx == null) {
-        var anchorIdx = currentMeasureIdx;
-        while (anchorIdx > 0 && !measureHasOnsetAt(anchorIdx - 1)) {
-          anchorIdx--;
-        }
-        restRunAnchorMeasureIdx = anchorIdx;
-        // Count consecutive no-onset measures for this span.
-        var noOnsetCount = 0;
-        for (var si = anchorIdx; si < boundaries.length; si++) {
-          if (measureHasOnsetAt(si)) break;
-          noOnsetCount++;
-        }
-        // Cap using remaining layout offset so regular rests after the multi-measure symbol
-        // are NOT counted as part of the span.
-        if (totalLayoutOffset > 0) {
-          var remainingOffset = Math.max(0, totalLayoutOffset - cumulativeRestOffset);
-          restRunSpanLength = Math.min(noOnsetCount, remainingOffset + 1);
-        } else {
-          restRunSpanLength = noOnsetCount;
-        }
-        if (restRunSpanLength < 1) restRunSpanLength = 1;
-      }
-      drawMeasureIdx = Math.max(0, restRunAnchorMeasureIdx - cumulativeRestOffset);
-    }
-
-    var blockX, blockY, blockW, blockH;
-    var layout = drawMeasureIdx < layoutPositions.length ? layoutPositions[drawMeasureIdx] : null;
-    var pageId = currentNotationPage - 1;
-
-    if (layout && layout.page === pageId) {
-      blockX = layout.left * w;
-      blockY = layout.top * h;
-      blockW = (layout.right - layout.left) * w;
-      blockH = (layout.bottom - layout.top) * h;
-    } else {
-      var systemTimes = track && track.systemTimeRanges ? track.systemTimeRanges : [];
-      var systemRegions = track && track.systemRegions ? track.systemRegions : [];
-      var pageCount = pdfDoc ? pdfDoc.numPages || 1 : 1;
-      var measureStart = boundaries[drawMeasureIdx][0];
-      var measureEnd = boundaries[drawMeasureIdx][1];
-      var useSystemLayout = systemTimes.length > 0 && systemRegions.length > 0;
-
-      if (useSystemLayout) {
-      var sysIdx = -1;
-      for (var s = 0; s < systemTimes.length; s++) {
-        if (playhead >= systemTimes[s][0] && playhead < systemTimes[s][1]) {
-          sysIdx = s;
-          break;
-        }
-      }
-      if (sysIdx < 0 && systemTimes.length > 0) {
-        if (playhead >= systemTimes[systemTimes.length - 1][1]) sysIdx = systemTimes.length - 1;
-        else sysIdx = 0;
-      }
-
-      var systemsPerPage = Math.max(1, Math.ceil(systemTimes.length / pageCount));
-      var pageFirstSystem = (currentNotationPage - 1) * systemsPerPage;
-      var pageLastSystem = Math.min(systemTimes.length, currentNotationPage * systemsPerPage) - 1;
-      if (sysIdx < pageFirstSystem || sysIdx > pageLastSystem) return;
-
-      var systemIdxInPage = sysIdx - pageFirstSystem;
-      var systemTop = (systemIdxInPage / systemsPerPage) * h;
-      var systemHeight = h / systemsPerPage;
-
-      var measuresInSystem = 1;
-      var measureIdxInSystem = 0;
-      if (sysIdx < systemRegions.length) {
-        var r = systemRegions[sysIdx];
-        measuresInSystem = Math.max(1, r[1] - r[0] + 1);
-        measureIdxInSystem = (drawMeasureIdx + 1) - r[0];
-        measureIdxInSystem = Math.max(0, Math.min(measuresInSystem - 1, measureIdxInSystem));
-      }
-
-      var measureWidth = w / measuresInSystem;
-      var staffHeight = systemHeight * 0.28;
-      blockX = measureIdxInSystem * measureWidth;
-      blockY = systemTop + (systemHeight - staffHeight) / 2;
-      blockW = measureWidth;
-      blockH = staffHeight;
-    } else {
-      var pageStart = (currentNotationPage - 1) / pageCount * totalDuration;
-      var pageEnd = currentNotationPage / pageCount * totalDuration;
-      var pageDuration = pageEnd - pageStart;
-      if (pageDuration <= 0) return;
-      if (playhead < pageStart || playhead >= pageEnd) return;
-      var mStartLocal = Math.max(0, measureStart - pageStart);
-      var mEndLocal = Math.min(pageDuration, measureEnd - pageStart);
-      var y1 = (mStartLocal / pageDuration) * h;
-      var y2 = (mEndLocal / pageDuration) * h;
-      var bandH = Math.max(4, y2 - y1);
-      var staffH = bandH * 0.28;
-      blockX = 0;
-      blockY = y1 + (bandH - staffH) / 2;
-      blockW = w;
-      blockH = staffH;
-    }
-    }
-
-    ctx.fillStyle = "rgba(220, 38, 38, 0.2)";
-    ctx.fillRect(blockX, blockY, blockW, blockH);
-    currentPdfMeasureRect = { x: blockX, y: blockY, w: blockW, h: blockH };
-    // timeMeasureIdx: always the actual MIDI measure for time-based note lookup.
-    // drawMeasureIdx may be remapped to a visual measure; timeMeasureIdx must not be.
-    var timeMeasureIdx = soundingNoteMeasureIdx >= 0 ? soundingNoteMeasureIdx : currentMeasureIdx;
-    var measureStart = boundaries[timeMeasureIdx][0];
-    var measureEnd = boundaries[timeMeasureIdx][1];
-    var measureNotes = [];
-    for (var n = 0; n < notes.length; n++) {
-      var nt = notes[n];
-      if (nt.time >= measureEnd) break;
-      // For note annotation sync, keep overlap-based inclusion so currently
-      // sounding notes (including ties/sustains) remain highlighted correctly.
-      if (nt.time + nt.duration > measureStart) measureNotes.push(nt);
-    }
-    // OMR note positions are indexed by musical events (chords/rests), while MIDI
-    // notes are per pitch. Group simultaneous notes so chord playback maps to one
-    // OMR entry instead of skipping into fallback green circles.
-    var measureEvents = [];
-    var eventEps = 1e-4;
-    for (var n = 0; n < measureNotes.length; n++) {
-      var nt = measureNotes[n];
-      if (measureEvents.length === 0) {
-        measureEvents.push({ time: nt.time, duration: nt.duration, notes: [nt] });
-      } else {
-        var lastEvt = measureEvents[measureEvents.length - 1];
-        if (Math.abs(nt.time - lastEvt.time) <= eventEps && Math.abs(nt.duration - lastEvt.duration) <= eventEps) {
-          lastEvt.notes.push(nt);
-        } else {
-          measureEvents.push({ time: nt.time, duration: nt.duration, notes: [nt] });
-        }
-      }
-    }
-    var currentEventIdx = -1;
-    for (var n = 0; n < measureEvents.length; n++) {
-      var ev = measureEvents[n];
-      if (playhead >= ev.time && playhead < ev.time + ev.duration) {
-        currentEventIdx = n;
-        break;
-      }
-    }
-    var activeRestEntry = null;
-    if (currentEventIdx < 0) {
-      // If we are inside a silent run (multi-measure rest can be represented only once),
-      // anchor to the rest entry in the anchored run.
-      if (measureNotes.length === 0) {
-        var anchorRest = firstRestAt(drawMeasureIdx);
-        if (!anchorRest) {
-          // Sometimes the only explicit rest symbol can be in a later measure of
-          // the same no-onset run; scan forward up to current position first.
-          for (var fwd = drawMeasureIdx + 1; fwd <= currentMeasureIdx; fwd++) {
-            if (measureHasOnsetAt(fwd)) break;
-            anchorRest = firstRestAt(fwd);
-            if (anchorRest) break;
-          }
-        }
-        if (!anchorRest) {
-          for (var back = drawMeasureIdx - 1; back >= 0; back--) {
-            if (measureHasOnsetAt(back)) break;
-            anchorRest = firstRestAt(back);
-            if (anchorRest) break;
-          }
-        }
-        activeRestEntry = anchorRest;
-      }
-    }
-
-    if (currentEventIdx >= 0) {
-      var measureRects = (drawMeasureIdx < notePositions.length) ? notePositions[drawMeasureIdx] : [];
-      var useNoteRects = layout && layout.page === pageId && measureRects.length > 0;
-      if (useNoteRects) {
-        // Map each playback event to one or more OMR rect entries.
-        // This handles both:
-        // - a single chord entry with multiple heads[] and
-        // - multiple simultaneous single-head chord entries.
-        var eventRectRanges = [];
-        var rectCursor = 0;
-        for (var ei = 0; ei < measureEvents.length; ei++) {
-          var needed = measureEvents[ei].notes.length;
-          var startRect = rectCursor;
-          var covered = 0;
-          while (rectCursor < measureRects.length && covered < needed) {
-            var rr = measureRects[rectCursor];
-            var units = 1;
-            if (rr && !rr.rest) {
-              if (rr.heads && rr.heads.length > 0) units = rr.heads.length;
-              else if (rr.head) units = 1;
-            }
-            covered += Math.max(1, units);
-            rectCursor++;
-          }
-          if (startRect === rectCursor && rectCursor < measureRects.length) rectCursor++;
-          eventRectRanges.push([startRect, rectCursor]);
-        }
-        var range = eventRectRanges[currentEventIdx] || [currentEventIdx, currentEventIdx + 1];
-        var rStart = Math.max(0, range[0]);
-        var rEnd = Math.min(measureRects.length, Math.max(range[1], rStart + 1));
-        var fillStyle = "rgba(22, 101, 52, 0.5)";
-        var strokeStyle = "rgb(22, 101, 52)";
-        ctx.fillStyle = fillStyle;
-        ctx.strokeStyle = strokeStyle;
-        ctx.lineWidth = 0.75;
-        for (var ri = rStart; ri < rEnd; ri++) {
-          var nr = measureRects[ri];
-          if (nr.rest) {
-            var l = nr.left * w, t = nr.top * h, r = nr.right * w, b = nr.bottom * h;
-            var cx = (l + r) / 2, cy = (t + b) / 2;
-            var dashLen = Math.min(20, (r - l) * 0.6);
-            ctx.beginPath();
-            ctx.moveTo(cx - dashLen / 2, cy);
-            ctx.lineTo(cx + dashLen / 2, cy);
-            ctx.stroke();
-          } else {
-            var headsToDraw = nr.heads || (nr.head ? [nr.head] : []);
-            for (var i = 0; i < headsToDraw.length; i++) {
-              var hdr = headsToDraw[i];
-              var hx = hdr.left * w, hy = hdr.top * h;
-              var hw = (hdr.right - hdr.left) * w, hh = (hdr.bottom - hdr.top) * h;
-              var cx = hx + hw / 2, cy = hy + hh / 2;
-              var rx = hw / 2, ry = hh / 2;
-              ctx.beginPath();
-              ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
-              ctx.fill();
-              ctx.stroke();
-            }
-            if (nr.stem) {
-              var s = nr.stem;
-              var sx = s.left * w, sy = s.top * h;
-              var sw = (s.right - s.left) * w, sh = (s.bottom - s.top) * h;
-              ctx.fillRect(sx, sy, sw, sh);
-              ctx.strokeRect(sx, sy, sw, sh);
-            }
-            if (headsToDraw.length === 0 && !nr.stem && nr.left != null) {
-              var nx = nr.left * w, ny = nr.top * h;
-              var nw = (nr.right - nr.left) * w, nh = (nr.bottom - nr.top) * h;
-              var cx = nx + nw / 2, cy = ny + nh / 2;
-              var base = Math.min(nw, nh);
-              var rx = Math.max(4, base * 0.48), ry = Math.max(5, base * 0.58);
-              ctx.beginPath();
-              ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
-              ctx.fill();
-              ctx.stroke();
-            }
-          }
-        }
-      } else if (measureEvents.length > 0) {
-        var frac = (currentEventIdx + 0.5) / measureEvents.length;
-        var dotX = blockX + frac * blockW;
-        var dotY = blockY + blockH / 2;
-        var dotRx = Math.min(10, blockW * 0.08);
-        var dotRy = Math.min(8, blockH * 0.35);
-        ctx.fillStyle = "rgba(22, 101, 52, 0.35)";
-        ctx.beginPath();
-        ctx.ellipse(dotX, dotY, dotRx, dotRy, 0, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.strokeStyle = "rgb(22, 101, 52)";
-        ctx.lineWidth = 1;
-        ctx.stroke();
-      }
-    } else if (activeRestEntry) {
-      ctx.fillStyle = "rgba(22, 101, 52, 0.5)";
-      ctx.strokeStyle = "rgb(22, 101, 52)";
-      ctx.lineWidth = 0.75;
-      var l2 = activeRestEntry.left * w, t2 = activeRestEntry.top * h;
-      var r2 = activeRestEntry.right * w, b2 = activeRestEntry.bottom * h;
-      var cx2 = (l2 + r2) / 2, cy2 = (t2 + b2) / 2;
-      var dashLen2 = Math.min(20, (r2 - l2) * 0.6);
-      ctx.beginPath();
-      ctx.moveTo(cx2 - dashLen2 / 2, cy2);
-      ctx.lineTo(cx2 + dashLen2 / 2, cy2);
-      ctx.stroke();
+    var encodedBreaks = track && track.recognitionReport
+      ? (sourceLayout && sourceLayout.preserved) || track.recognitionReport.has_encoded_breaks === true
+      : !!(track && track.systemRegions && track.systemRegions.length > 1);
+    // Set BEFORE importing as well as before redoLayout: an import must not
+    // start with the previous track's condensation or automatic line breaks.
+    verovioTk.setOptions({
+        pageWidth: pageW,
+        pageHeight: pageH,
+        scale: 100,
+        adjustPageWidth: false,
+        adjustPageHeight: true,
+        // Keep corresponding measures on the same system as the source.
+        // Without encoded breaks, row 2 can end with a different measure.
+        breaks: encodedBreaks ? "encoded" : "auto",
+        breaksNoWidow: false,
+        systemMaxPerPage: 0,
+        condense: "none",
+        spacingNonLinear: 0.6,
+        spacingLinear: 0.25,
+      });
+    if (relayout !== false && typeof verovioTk.redoLayout === "function") {
+      verovioTk.redoLayout();
     }
   }
 
   function updatePageNav() {
     if (!pageNavSection) return;
     var total = 1;
-    if (viewMode === "pdf" && pdfDoc) total = pdfDoc.numPages || 1;
-    else if (verovioTk && hasVerovioScore) total = verovioTk.getPageCount ? verovioTk.getPageCount() : 1;
-    else if (pdfDoc) total = pdfDoc.numPages || 1;
+    if (verovioTk && hasVerovioScore) total = verovioTk.getPageCount ? verovioTk.getPageCount() : 1;
     if (total <= 1) {
       pageNavSection.hidden = true;
       return;
@@ -583,159 +150,16 @@
     if (nextPageBtn) nextPageBtn.disabled = currentNotationPage >= total;
   }
 
-  /*
-   * Convert a VISUAL measure index (as used by layoutPositions) to the
-   * corresponding MIDI measure index (as used by measureBoundaries).
-   * These differ when multi-measure rests are collapsed by Audiveris into one
-   * visual measure but expanded to N separate entries by music21.
-   */
-  function getMidiIndexForVisual(visualIdx) {
-    var track = currentTrackForLayout;
-    if (!track) return visualIdx;
-    var boundaries = track.measureBoundaries || [];
-    var layoutPositions = track.measureLayoutPositions || [];
-    var totalLayoutOffset = Math.max(0, boundaries.length - layoutPositions.length);
-    if (totalLayoutOffset === 0) return visualIdx;
-    var cumOffset = 0;
-    var i = 0;
-    while (i < boundaries.length) {
-      var curVisual = i - cumOffset;
-      if (curVisual === visualIdx) return i;
-      if (curVisual > visualIdx) break;
-      if (cumOffset < totalLayoutOffset && !_midiMeasureHasOnset(boundaries, i)) {
-        var remainingOffset = Math.max(0, totalLayoutOffset - cumOffset);
-        var noOnsetCount = 0;
-        for (var si = i; si < boundaries.length; si++) {
-          if (_midiMeasureHasOnset(boundaries, si)) break;
-          noOnsetCount++;
-        }
-        var span = Math.min(noOnsetCount, remainingOffset + 1);
-        if (span < 1) span = 1;
-        cumOffset += span - 1;
-        i += span;
-      } else {
-        i++;
-      }
-    }
-    return Math.min(i, boundaries.length - 1);
-  }
-
-  /* Check if MIDI measure i has any note onsets (module-level helper). */
-  function _midiMeasureHasOnset(boundaries, i) {
-    if (!boundaries || i < 0 || i >= boundaries.length) return false;
-    var bs = boundaries[i][0], be = boundaries[i][1];
-    for (var k = 0; k < notes.length; k++) {
-      if (notes[k].time >= be) break;
-      if (notes[k].time >= bs && notes[k].time < be) return true;
-    }
-    return false;
-  }
-
-  /*
-   * Compute the cumulativeRestOffset for a given seek time by scanning from the
-   * start.  This is used after seekTo() resets the state so that the rest-span
-   * remapping is immediately correct without waiting for playback to walk through
-   * every rest span again.
-   */
-  function computeRestOffsetForTime(seekTime) {
-    var track = currentTrackForLayout;
-    if (!track) return 0;
-    var boundaries = track.measureBoundaries || [];
-    var layoutPositions = track.measureLayoutPositions || [];
-    var totalLayoutOffset = Math.max(0, boundaries.length - layoutPositions.length);
-    if (totalLayoutOffset === 0 || !boundaries.length) return 0;
-    var cumOffset = 0;
-    var i = 0;
-    while (i < boundaries.length && boundaries[i][0] < seekTime && cumOffset < totalLayoutOffset) {
-      if (!_midiMeasureHasOnset(boundaries, i)) {
-        var remainingOffset = Math.max(0, totalLayoutOffset - cumOffset);
-        var noOnsetCount = 0;
-        for (var si = i; si < boundaries.length; si++) {
-          if (_midiMeasureHasOnset(boundaries, si)) break;
-          noOnsetCount++;
-        }
-        var span = Math.min(noOnsetCount, remainingOffset + 1);
-        if (span < 1) span = 1;
-        var spanEnd = i + span;
-        var spanEndTime = spanEnd < boundaries.length ? boundaries[spanEnd][0] : Infinity;
-        if (spanEndTime <= seekTime) {
-          cumOffset += span - 1;
-          i = spanEnd;
-        } else {
-          break;  /* inside this rest span */
-        }
-      } else {
-        i++;
-      }
-    }
-    return cumOffset;
-  }
-
-  /*
-   * Return the playback time (seconds) corresponding to the first measure on the
-   * given PDF page (1-based).  Accounts for multi-measure rest remapping.
-   */
-  function getTimeForPage(pageNum) {
-    var track = currentTrackForLayout;
-    if (!track) return null;
-    var boundaries = track.measureBoundaries || [];
-    var layoutPositions = track.measureLayoutPositions || [];
-    if (!boundaries.length || !layoutPositions.length) return null;
-    var targetPageIdx = pageNum - 1;
-    /* Find the first visual measure on this page. */
-    var j_first = -1;
-    for (var j = 0; j < layoutPositions.length; j++) {
-      if (layoutPositions[j] && layoutPositions[j].page === targetPageIdx) {
-        j_first = j;
-        break;
-      }
-    }
-    if (j_first <= 0) return 0;  /* page 1 or not found → start */
-    /* Scan MIDI measures tracking cumulative offset to find the one that maps to j_first. */
-    var totalLayoutOffset = Math.max(0, boundaries.length - layoutPositions.length);
-    var cumOffset = 0;
-    var i = 0;
-    while (i < boundaries.length) {
-      var visualIdx = i - cumOffset;
-      if (visualIdx >= j_first) return boundaries[i][0];
-      if (totalLayoutOffset > 0 && cumOffset < totalLayoutOffset &&
-          !_midiMeasureHasOnset(boundaries, i)) {
-        var remainingOffset = Math.max(0, totalLayoutOffset - cumOffset);
-        var noOnsetCount = 0;
-        for (var si = i; si < boundaries.length; si++) {
-          if (_midiMeasureHasOnset(boundaries, si)) break;
-          noOnsetCount++;
-        }
-        var span = Math.min(noOnsetCount, remainingOffset + 1);
-        if (span < 1) span = 1;
-        if (i - cumOffset >= j_first) return boundaries[i][0];
-        cumOffset += span - 1;
-        i += span;
-      } else {
-        i++;
-      }
-    }
-    return boundaries[boundaries.length - 1][0];
-  }
-
   function goToPage(pageNum) {
-    var total = 1;
-    if (viewMode === "pdf" && pdfDoc) total = pdfDoc.numPages || 1;
-    else if (verovioTk && hasVerovioScore) total = verovioTk.getPageCount ? verovioTk.getPageCount() : 1;
-    else if (pdfDoc) total = pdfDoc.numPages || 1;
-    var p = Math.max(1, Math.min(total, pageNum));
-    currentNotationPage = p;
-    /* Seek playhead to the first measure on the target page so the red rectangle,
-       note highlight, and progress bar all update to match. */
-    if (notes.length > 0 && totalDuration > 0) {
-      var pageTime = getTimeForPage(p);
-      if (pageTime != null) seekTo(pageTime);
-    }
-    if (viewMode === "pdf" && pdfDoc) {
-      renderPdfPage(p);
-    } else if (verovioTk && verovioNotation && hasVerovioScore) {
-      verovioNotation.innerHTML = verovioTk.renderToSVG(p);
-      updateNotationView();
+    if (!verovioTk || !hasVerovioScore) return;
+    var total = verovioTk.getPageCount();
+    currentNotationPage = Math.max(1, Math.min(total, pageNum));
+    clearVerovioHighlights();
+    verovioNotation.innerHTML = verovioTk.renderToSVG(currentNotationPage);
+    var firstNote = verovioNotation.querySelector("g.note[id]");
+    if (firstNote && typeof verovioTk.getTimeForElement === "function") {
+      var time = verovioTk.getTimeForElement(firstNote.id);
+      if (Number.isFinite(time) && time >= 0) seekTo(time / 1000);
     }
     updatePageNav();
   }
@@ -754,78 +178,16 @@
     return Math.min(totalDuration, lastValidSec + stepSec);
   }
 
-  function updateNotationView() {
-    if (viewMode === "pdf") {
-      var pageCount = pdfDoc ? pdfDoc.numPages || 1 : 1;
-      if (pageCount > 1 && totalDuration > 0) {
-        var targetPage = currentNotationPage;
-        var track = currentTrackForLayout;
-        var boundaries = track && track.measureBoundaries ? track.measureBoundaries : [];
-        var layoutPositions = track && track.measureLayoutPositions ? track.measureLayoutPositions : [];
-        // Find which PDF page the current measure is on using OMR layout positions.
-        // IMPORTANT: layoutPositions is indexed by VISUAL (OMR/sheet) measures, while
-        // measureBoundaries is indexed by music21 MIDI measures. These differ when a
-        // multi-measure rest is one visual measure in Audiveris but 6 separate entries
-        // in music21. Apply the same rest-span remapping used by drawPdfOverlay so
-        // we look up the correct visual measure index in layoutPositions.
-        var foundPage = false;
-        if (layoutPositions.length > 0 && boundaries.length > 0) {
-          var rawMeasureIdx = -1;
-          for (var i = 0; i < boundaries.length; i++) {
-            if (playhead >= boundaries[i][0] && playhead < boundaries[i][1]) {
-              rawMeasureIdx = i;
-              break;
-            }
-          }
-          if (rawMeasureIdx < 0 && playhead >= boundaries[boundaries.length - 1][1]) {
-            rawMeasureIdx = boundaries.length - 1;
-          }
-          if (rawMeasureIdx >= 0) {
-            // Remap to visual measure index using cumulativeRestOffset (same logic as drawPdfOverlay).
-            var visualMeasureIdx;
-            if (restRunAnchorMeasureIdx != null &&
-                rawMeasureIdx >= restRunAnchorMeasureIdx &&
-                rawMeasureIdx < restRunAnchorMeasureIdx + restRunSpanLength) {
-              // Inside a rest span: show the anchor's visual position.
-              visualMeasureIdx = Math.max(0, restRunAnchorMeasureIdx - cumulativeRestOffset);
-            } else {
-              // After a rest (or no rest): subtract cumulative offset.
-              visualMeasureIdx = Math.max(0, rawMeasureIdx - cumulativeRestOffset);
-            }
-            visualMeasureIdx = Math.max(0, Math.min(layoutPositions.length - 1, visualMeasureIdx));
-            if (layoutPositions[visualMeasureIdx] && layoutPositions[visualMeasureIdx].page != null) {
-              targetPage = layoutPositions[visualMeasureIdx].page + 1;
-              foundPage = true;
-            }
-          }
-        }
-        if (!foundPage) {
-          // Fallback: proportional split (less accurate but safe).
-          var ratio = playhead / totalDuration;
-          targetPage = Math.min(pageCount, Math.max(1, Math.ceil(ratio * pageCount)));
-        }
-        targetPage = Math.max(1, Math.min(pageCount, targetPage));
-        if (targetPage !== currentNotationPage) {
-          currentNotationPage = targetPage;
-          renderPdfPage(currentNotationPage);
-          updatePageNav();
-        }
-      }
-      drawPdfOverlay();
-      return;
-    }
+  function updateNotationView(followPlayback) {
     if (!hasVerovioScore || !verovioTk) return;
+    playbackHighlightVisible = true;
     var track = currentTrackForLayout;
     var timeMs = playhead * 1000;
     var currentElements = verovioTk.getElementsAtTime(timeMs);
-    var pageCount = verovioTk.getPageCount ? verovioTk.getPageCount() : 1;
     var targetPage = currentNotationPage;
 
     if (currentElements && currentElements.page && currentElements.page !== 0) {
       targetPage = currentElements.page;
-    } else if (pageCount > 1 && totalDuration > 0) {
-      var ratio = playhead / totalDuration;
-      targetPage = Math.min(pageCount, Math.max(1, Math.ceil(ratio * pageCount)));
     }
 
     if (targetPage !== currentNotationPage) {
@@ -851,10 +213,24 @@
         }
       }
       var measureEl = null;
+      var cursorNote = null;
+      var latestOnset = -Infinity;
       var hasPlayingNotes = currentElements && currentElements.notes && currentElements.notes.length;
       if (hasPlayingNotes) {
-        var firstNoteEl = verovioNotation.querySelector("#" + CSS.escape(currentElements.notes[0])) || document.getElementById(currentElements.notes[0]);
-        measureEl = firstNoteEl && firstNoteEl.closest ? (firstNoteEl.closest("g.measure") || firstNoteEl.closest("[class*='measure']")) : null;
+        currentElements.notes.forEach(function (id) {
+          var note = verovioNotation.querySelector("#" + CSS.escape(id));
+          if (!note) return;
+          note.classList.add("playing");
+          note.setAttribute("data-playing", "1");
+          // A sustained chord in one voice must not pin the marker to the
+          // beginning of the bar while the other voice moves forward.
+          var onset = typeof verovioTk.getTimeForElement === "function" ? verovioTk.getTimeForElement(id) : 0;
+          if (onset >= latestOnset) {
+            latestOnset = onset;
+            cursorNote = note;
+          }
+        });
+        measureEl = cursorNote && cursorNote.closest("g.measure");
       }
       if (!measureEl && currentElements && track && track.measureBoundaries) {
         var boundaries = track.measureBoundaries;
@@ -863,7 +239,7 @@
             var sampleMs = (boundaries[b][0] + 0.05) * 1000;
             var sampleEl = verovioTk.getElementsAtTime(sampleMs);
             if (sampleEl && sampleEl.notes && sampleEl.notes.length) {
-              var sampleNoteEl = verovioNotation.querySelector("#" + CSS.escape(sampleEl.notes[0])) || document.getElementById(sampleEl.notes[0]);
+              var sampleNoteEl = verovioNotation.querySelector("#" + CSS.escape(sampleEl.notes[0]));
               measureEl = sampleNoteEl && sampleNoteEl.closest ? (sampleNoteEl.closest("g.measure") || sampleNoteEl.closest("[class*='measure']")) : null;
             }
             break;
@@ -871,16 +247,6 @@
         }
       }
       if (measureEl || hasPlayingNotes) {
-        if (hasPlayingNotes) {
-          for (var j = 0; j < currentElements.notes.length; j++) {
-            var noteId = currentElements.notes[j];
-            var el = document.getElementById(noteId) || verovioNotation.querySelector("#" + CSS.escape(noteId));
-            if (el) {
-              el.classList.add("playing");
-              el.setAttribute("data-playing", "1");
-            }
-          }
-        }
         if (measureHighlight && notationViewport && measureEl) {
           var vpRect = notationViewport.getBoundingClientRect();
           var mRect = measureEl.getBoundingClientRect();
@@ -889,20 +255,39 @@
           measureHighlight.style.top = (mRect.top - vpRect.top) + "px";
           measureHighlight.style.width = mRect.width + "px";
           measureHighlight.style.height = mRect.height + "px";
+          if (cursorNote && playbackCursor) {
+            var notehead = cursorNote.querySelector(".notehead") || cursorNote;
+            var nRect = notehead.getBoundingClientRect();
+            playbackCursor.hidden = false;
+            playbackCursor.style.left = (nRect.left + nRect.width / 2 - vpRect.left) + "px";
+            playbackCursor.style.top = (mRect.top - vpRect.top) + "px";
+            playbackCursor.style.height = mRect.height + "px";
+          } else if (playbackCursor) {
+            playbackCursor.hidden = true;
+          }
+          var system = measureEl.closest("g.system") || measureEl;
+          if (isPlaying && followPlayback !== false && system !== followedSystem) {
+            followedSystem = system;
+            var sRect = system.getBoundingClientRect();
+            if ((sRect.top < 0 || sRect.bottom > window.innerHeight) && system.scrollIntoView) {
+              system.scrollIntoView({ block: "nearest", behavior: "smooth" });
+            }
+          }
         } else if (measureHighlight) {
           measureHighlight.style.display = "none";
+          if (playbackCursor) playbackCursor.hidden = true;
         }
       } else if (measureHighlight) {
         measureHighlight.style.display = "none";
+        if (playbackCursor) playbackCursor.hidden = true;
       }
     }
   }
 
   function clearVerovioHighlights() {
-    if (viewMode === "pdf" && pdfOverlay && pdfOverlay.getContext) {
-      var ctx = pdfOverlay.getContext("2d");
-      if (ctx) ctx.clearRect(0, 0, pdfOverlay.width || 0, pdfOverlay.height || 0);
-    }
+    playbackHighlightVisible = false;
+    followedSystem = null;
+    if (playbackCursor) playbackCursor.hidden = true;
     if (measureHighlight) {
       measureHighlight.style.display = "none";
     }
@@ -919,26 +304,6 @@
           kids[k].style.fill = "";
           kids[k].style.stroke = "";
         }
-      }
-    }
-  }
-
-  function switchView(mode) {
-    viewMode = mode;
-    if (viewPdfBtn) viewPdfBtn.classList.toggle("active", mode === "pdf");
-    if (viewNotationBtn) viewNotationBtn.classList.toggle("active", mode === "notation");
-    if (mode === "pdf") {
-      if (pdfContainer) pdfContainer.hidden = false;
-      if (notationViewport) notationViewport.hidden = true;
-      if (verovioNotation) verovioNotation.hidden = true;
-      if (pdfDoc) renderPdfPage(currentNotationPage);
-    } else {
-      if (pdfContainer) pdfContainer.hidden = true;
-      if (notationViewport) notationViewport.hidden = false;
-      if (verovioNotation) verovioNotation.hidden = false;
-      if (verovioTk && hasVerovioScore) {
-        verovioNotation.innerHTML = verovioTk.renderToSVG(currentNotationPage);
-        updateNotationView();
       }
     }
   }
@@ -1214,7 +579,8 @@
     progressText.textContent = formatTime(playhead) + " / " + formatTime(endTime);
     updateNotationView();
 
-    var reachedEnd = lastPlayedIndex >= notes.length || playhead >= endTime;
+    // Let the last note finish; scheduling it is not the end of playback.
+    var reachedEnd = playhead >= endTime;
     if (!reachedEnd) {
       rafId = requestAnimationFrame(tick);
     } else {
@@ -1231,7 +597,11 @@
   }
 
   function play() {
-    if (!instrument || !notes.length) return;
+    if (isPlaying || trackLoading || !instrument || !notes.length) return;
+    if (playhead >= (scoreDuration > 0 ? scoreDuration : totalDuration)) {
+      playhead = 0;
+      lastPlayedIndex = 0;
+    }
     clearPracticeFeedback();
     ensureAudioContext().resume();
     hideError();
@@ -1240,10 +610,16 @@
     pauseBtn.disabled = false;
     stopBtn.disabled = false;
     startRealTime = performance.now() - (playhead / tempo) * 1000;
+    updateNotationView();
     rafId = requestAnimationFrame(tick);
   }
 
   function pause() {
+    if (isPlaying) {
+      var endTime = scoreDuration > 0 ? scoreDuration : totalDuration;
+      playhead = Math.min(endTime, (performance.now() - startRealTime) / 1000 * tempo);
+      updateNotationView(false);
+    }
     isPlaying = false;
     if (rafId) {
       cancelAnimationFrame(rafId);
@@ -1259,18 +635,23 @@
     pause();
     playhead = 0;
     lastPlayedIndex = 0;
-    restRunAnchorMeasureIdx = null;
-    restRunSpanLength = 0;
-    cumulativeRestOffset = 0;
     progressBar.style.width = "0%";
     var endTime = scoreDuration > 0 ? scoreDuration : totalDuration;
     progressText.textContent = "0:00 / " + formatTime(endTime);
     clearVerovioHighlights();
+    stopBtn.disabled = true;
   }
 
   function onTempoChange() {
+    var now = performance.now();
+    if (isPlaying) {
+      var endTime = scoreDuration > 0 ? scoreDuration : totalDuration;
+      playhead = Math.min(endTime, (now - startRealTime) / 1000 * tempo);
+    }
     tempo = parseFloat(tempoSlider.value);
+    if (isPlaying) startRealTime = now - (playhead / tempo) * 1000;
     tempoValueEl.textContent = tempo.toFixed(1) + "×";
+    if (playbackHighlightVisible) updateNotationView(false);
   }
 
   function seekTo(seconds) {
@@ -1279,9 +660,6 @@
     var t = Math.max(0, Math.min(endTime, seconds));
     playhead = t;
     lastPlayedIndex = 0;
-    restRunAnchorMeasureIdx = null;
-    restRunSpanLength = 0;
-    cumulativeRestOffset = computeRestOffsetForTime(t);
     while (lastPlayedIndex < notes.length && notes[lastPlayedIndex].time < playhead) {
       lastPlayedIndex++;
     }
@@ -1292,72 +670,6 @@
     if (isPlaying) {
       startRealTime = performance.now() - (playhead / tempo) * 1000;
     }
-  }
-
-  function getTimeFromPdfOverlayPoint(clientX, clientY) {
-    if (!pdfOverlay || !currentTrackForLayout || totalDuration <= 0) return null;
-    var rect = pdfOverlay.getBoundingClientRect();
-    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
-    var x = Math.max(0, Math.min(rect.width, clientX - rect.left));
-    var y = Math.max(0, Math.min(rect.height, clientY - rect.top));
-    var w = rect.width;
-    var h = rect.height;
-
-    var boundaries = currentTrackForLayout.measureBoundaries || [];
-    var layoutPositions = currentTrackForLayout.measureLayoutPositions || [];
-    if (!boundaries.length) return null;
-    var pageId = currentNotationPage - 1;
-
-    // Prefer precise measure mapping from OMR/PDF layout boxes on current page.
-    // bestVisualIdx is a VISUAL (layoutPositions) index; convert to MIDI for boundaries.
-    var bestVisualIdx = -1;
-    var bestDist = Number.POSITIVE_INFINITY;
-    for (var j = 0; j < layoutPositions.length; j++) {
-      var lp = layoutPositions[j];
-      if (!lp || lp.page !== pageId) continue;
-      var lx = lp.left * w;
-      var ly = lp.top * h;
-      var lw = (lp.right - lp.left) * w;
-      var lh = (lp.bottom - lp.top) * h;
-      var rx = lx + lw;
-      var by = ly + lh;
-      if (x >= lx && x <= rx && y >= ly && y <= by) {
-        bestVisualIdx = j;
-        bestDist = 0;
-        break;
-      }
-      var dx = x < lx ? (lx - x) : (x > rx ? (x - rx) : 0);
-      var dy = y < ly ? (ly - y) : (y > by ? (y - by) : 0);
-      var d = dx * dx + dy * dy;
-      if (d < bestDist) {
-        bestDist = d;
-        bestVisualIdx = j;
-      }
-    }
-
-    if (bestVisualIdx >= 0) {
-      var midiIdx = getMidiIndexForVisual(bestVisualIdx);
-      var m = boundaries[midiIdx];
-      if (!m) return null;
-      var mStart = m[0], mEnd = m[1];
-      if (!(mEnd > mStart)) return mStart;
-      var lp2 = layoutPositions[bestVisualIdx];
-      var span = Math.max(1e-6, lp2.right - lp2.left);
-      var fx = Math.max(0, Math.min(1, ((x / w) - lp2.left) / span));
-      return mStart + fx * (mEnd - mStart);
-    }
-
-    // Fallback: seek proportionally within current page width.
-    var endTime = scoreDuration > 0 ? scoreDuration : totalDuration;
-    var pageCount = pdfDoc ? (pdfDoc.numPages || 1) : 1;
-    var pageStart = ((currentNotationPage - 1) / pageCount) * endTime;
-    var pageEnd = (currentNotationPage / pageCount) * endTime;
-    return pageStart + (x / w) * Math.max(0, pageEnd - pageStart);
-  }
-
-  function handleOverlaySeek(e) {
-    var t = getTimeFromPdfOverlayPoint(e.clientX, e.clientY);
-    if (t != null) seekTo(t);
   }
 
   function handleProgressSeek(e) {
@@ -1371,187 +683,114 @@
   }
 
   function setupTrackFromStoredData(track) {
-    if (pdfBlobUrl) {
-      URL.revokeObjectURL(pdfBlobUrl);
-      pdfBlobUrl = null;
-    }
-    var pdfLoadPromise = Promise.resolve({ dims: null });
-    if (track.file) {
-      pdfBlobUrl = URL.createObjectURL(track.file);
-      pdfLoadPromise = loadPdfAndGetDimensions(pdfBlobUrl);
-    }
-    return pdfLoadPromise.then(function (pdfResult) {
-      currentTrackForLayout = track;
-      restRunAnchorMeasureIdx = null;
-      restRunSpanLength = 0;
-      cumulativeRestOffset = 0;
-      var pdfDims = pdfResult && pdfResult.dims;
-      var pdfWidthPt = pdfDims && pdfDims.width ? pdfDims.width : 0;
-      var n = track.measuresPerLine != null ? track.measuresPerLine : track.measuresPerFirstSystem;
-      if (n == null) n = 2;
-      if (n != null && n > 4) n = 4;
-      measuresPerLineMultiplier = Math.max(1, Math.min(10, n));
-      if (measuresPerLineSelect) measuresPerLineSelect.value = String(measuresPerLineMultiplier);
-      if (pdfWidthPt > 0 && n != null && n > 0) {
-        var contentWidthPx = pdfWidthPt * PDF_CONTENT_WIDTH_FACTOR * PDF_DISPLAY_SCALE * LAYOUT_PAGE_WIDTH_FACTOR;
-        track.layoutParams = {
-          pageWidthVerovio: Math.round(contentWidthPx),
-          measuresPerLineForPageWidth: n,
-        };
-      } else {
-        track.layoutParams = null;
+    // Keep the engine associated with the result, including older playlist entries.
+    if (recognitionEngineEl) recognitionEngineEl.textContent = ENGINE_LABELS[track.engine]
+      ? "Recognized by " + ENGINE_LABELS[track.engine] : "Recognition engine not recorded";
+    if (musicxmlBlobUrl) URL.revokeObjectURL(musicxmlBlobUrl);
+    musicxmlBlobUrl = null;
+    musicxmlDownload.hidden = true;
+    musicxmlDownload.removeAttribute("href");
+    notationMessage.hidden = true;
+    notationViewport.hidden = true;
+    verovioNotation.hidden = true;
+    verovioNotation.innerHTML = "";
+    clearVerovioHighlights();
+    hasVerovioScore = false;
+    notes = [];
+    midiData = null;
+    totalDuration = 0;
+    scoreDuration = 0;
+    currentNotationPage = 1;
+    currentTrackForLayout = track;
+    if (recognitionReview) {
+      var report = track.recognitionReport;
+      recognitionReview.hidden = !report;
+      recognitionReview.open = false;
+      if (report) {
+        var issues = report.issues || [];
+        var sourceLayout = report.source_layout;
+        var warnings = (report.export_warnings || []).concat(sourceLayout ? (sourceLayout.warnings || []) : []);
+        var numbers = Array.from(new Set(issues.map(function (i) { return i.measure; })));
+        document.getElementById("recognitionSummary").textContent = numbers.length
+          ? "Check measures " + numbers.join(", ") + " — recognition may be incomplete"
+          : (warnings.length ? "Recognition export required recovery — review details" : "Automatic transcription — compare with the original");
+        document.getElementById("recognitionNotice").textContent = report.notice || "Review the automatic transcription against your source file.";
+        if (sourceLayout && sourceLayout.preserved) {
+          document.getElementById("recognitionNotice").textContent += " Source layout preserved: "
+            + sourceLayout.systems.length + " systems; staves per system: "
+            + sourceLayout.systems.map(function (s) { return s.staff_count; }).join(", ")
+            + "; measures per system: " + sourceLayout.systems.map(function (s) { return s.measure_count; }).join(", ") + ".";
+        }
+        var issueList = document.getElementById("recognitionIssues");
+        issueList.replaceChildren();
+        warnings.concat(issues.map(function (i) { return i.message; })).forEach(function (message) {
+          var item = document.createElement("li");
+          item.textContent = message;
+          issueList.appendChild(item);
+        });
       }
-      return verovioReady.then(function () {
-        var uploadData = {
-          midi_base64: track.midiBase64,
-          musicxml_base64: track.musicxmlBase64 || null,
-          musicxml_format: track.musicxmlFormat || null,
-        };
-        if (viewToggle) viewToggle.hidden = true;
-        if (uploadData.musicxml_base64 && typeof verovio !== "undefined") {
-          try {
-            var binary = atob(uploadData.musicxml_base64);
-            var bytes = new Uint8Array(binary.length);
-            for (var i = 0; i < binary.length; i++) {
-              bytes[i] = binary.charCodeAt(i);
-            }
-            if (uploadData.musicxml_format === "mxl") {
-              verovioTk.loadZipDataBuffer(bytes.buffer);
-            } else {
-              verovioTk.loadData(new TextDecoder().decode(bytes));
-            }
-            var verovioMidiBase64 = verovioTk.renderToMIDI();
-            var useBackendMidi = false;
-            if (verovioMidiBase64) {
-              var midiBinary = atob(verovioMidiBase64);
-              var midiBytes = new Uint8Array(midiBinary.length);
-              for (var j = 0; j < midiBinary.length; j++) {
-                midiBytes[j] = midiBinary.charCodeAt(j);
-              }
-              midiData = new Midi(midiBytes.buffer);
-              notes = collectNotes(midiData);
-              if (notes.length === 0 && uploadData.midi_base64) {
-                useBackendMidi = true;
-              }
-            } else {
-              useBackendMidi = true;
-            }
-            if (useBackendMidi && uploadData.midi_base64) {
-              var fallbackBinary = atob(uploadData.midi_base64);
-              var fallbackBytes = new Uint8Array(fallbackBinary.length);
-              for (var k = 0; k < fallbackBytes.length; k++) {
-                fallbackBytes[k] = fallbackBinary.charCodeAt(k);
-              }
-              midiData = new Midi(fallbackBytes.buffer);
-              notes = collectNotes(midiData);
-            }
-            if (midiData) {
-              totalDuration = midiData.duration;
-              currentNotationPage = 1;
-              hasVerovioScore = true;
-              applyVerovioLayout();
-              if (verovioNotation) verovioNotation.innerHTML = verovioTk.renderToSVG(1);
-              /* If Verovio rendered title-only/blank (no note elements), show PDF instead */
-              var svgHasNotes = verovioNotation && verovioNotation.querySelector && verovioNotation.querySelector('[class*="note"]');
-              if (!svgHasNotes && pdfContainer && track.file) {
-                hasVerovioScore = false;
-                if (verovioNotation) verovioNotation.hidden = true;
-                if (notationViewport) notationViewport.hidden = true;
-                if (pdfContainer) pdfContainer.hidden = false;
-                if (pdfDoc) renderPdfPage(1);
-                if (notationTitle) notationTitle.textContent = "Sheet Music (PDF – notation preview unavailable)";
-              } else if (pdfContainer && track.file && pdfDoc) {
-                /* PDF preferred; Notation has playback highlight (red) */
-                viewMode = "pdf";
-                if (viewToggle) viewToggle.hidden = false;
-                switchView("pdf");
-              } else {
-                if (pdfContainer) pdfContainer.hidden = true;
-                if (notationViewport) notationViewport.hidden = false;
-                if (verovioNotation) verovioNotation.hidden = false;
-              }
-              if (layoutSection) layoutSection.hidden = false;
-              if (notationTitle && hasVerovioScore) notationTitle.textContent = "Sheet Music";
-              notationSection.hidden = false;
-              scoreDuration = hasVerovioScore ? getVerovioScoreDuration() : 0;
-              updatePageNav();
-              if (recordBtn) recordBtn.disabled = notes.length === 0;
-              if (stopRecordBtn) stopRecordBtn.disabled = true;
-              if (practiceHint) { practiceHint.hidden = false; practiceHint.textContent = "Record your playing and compare it to the sheet music."; }
-            } else {
-              throw new Error("Verovio MIDI failed");
-            }
-          } catch (e) {
-            var fallbackBinary = atob(uploadData.midi_base64);
-            var fallbackBytes = new Uint8Array(fallbackBinary.length);
-            for (var k = 0; k < fallbackBytes.length; k++) {
-              fallbackBytes[k] = fallbackBinary.charCodeAt(k);
-            }
-            midiData = new Midi(fallbackBytes.buffer);
-            notes = collectNotes(midiData);
-            totalDuration = midiData.duration;
-            currentNotationPage = 1;
-            hasVerovioScore = true;
-            applyVerovioLayout();
-            if (pdfContainer) pdfContainer.hidden = true;
-            if (notationViewport) notationViewport.hidden = false;
-            if (verovioNotation) {
-              verovioNotation.innerHTML = verovioTk.renderToSVG(1);
-              verovioNotation.hidden = false;
-            }
-            var svgHasNotes = verovioNotation && verovioNotation.querySelector && verovioNotation.querySelector('[class*="note"]');
-            if (!svgHasNotes && pdfContainer && track.file) {
-              hasVerovioScore = false;
-              if (verovioNotation) verovioNotation.hidden = true;
-              if (notationViewport) notationViewport.hidden = true;
-              if (pdfContainer) pdfContainer.hidden = false;
-              if (pdfDoc) renderPdfPage(1);
-              if (notationTitle) notationTitle.textContent = "Sheet Music (PDF – notation preview unavailable)";
-            } else if (svgHasNotes && pdfContainer && track.file && pdfDoc) {
-              viewMode = "pdf";
-              if (viewToggle) viewToggle.hidden = false;
-              switchView("pdf");
-            } else if (svgHasNotes) {
-              if (pdfContainer) pdfContainer.hidden = true;
-              if (notationViewport) notationViewport.hidden = false;
-              if (verovioNotation) verovioNotation.hidden = false;
-            }
-            if (layoutSection) layoutSection.hidden = false;
-            if (notationTitle && hasVerovioScore) notationTitle.textContent = "Sheet Music";
-            notationSection.hidden = false;
-            scoreDuration = hasVerovioScore ? getVerovioScoreDuration() : 0;
-            updatePageNav();
-            if (recordBtn) recordBtn.disabled = notes.length === 0;
-            if (stopRecordBtn) stopRecordBtn.disabled = true;
-            if (practiceHint) { practiceHint.hidden = false; practiceHint.textContent = "Record your playing and compare it to the sheet music."; }
-          }
-        } else {
-          var fallbackBinary = atob(uploadData.midi_base64);
-          var fallbackBytes = new Uint8Array(fallbackBinary.length);
-          for (var k = 0; k < fallbackBytes.length; k++) {
-            fallbackBytes[k] = fallbackBinary.charCodeAt(k);
-          }
-          midiData = new Midi(fallbackBytes.buffer);
+    }
+    return verovioReady.then(function () {
+      var xmlBytes = null;
+      if (track.musicxmlBase64) {
+        xmlBytes = Uint8Array.from(atob(track.musicxmlBase64), function (c) { return c.charCodeAt(0); });
+        musicxmlBlobUrl = URL.createObjectURL(new Blob([xmlBytes], {
+          type: track.musicxmlFormat === "mxl" ? "application/vnd.recordare.musicxml" : "application/vnd.recordare.musicxml+xml",
+        }));
+        musicxmlDownload.href = musicxmlBlobUrl;
+        musicxmlDownload.download = (track.filename || "score") + (track.musicxmlFormat === "mxl" ? ".mxl" : ".musicxml");
+        musicxmlDownload.hidden = false;
+      }
+      var renderedMidi = null;
+      try {
+        if (!xmlBytes) throw new Error("No MusicXML was returned.");
+        if (!verovioTk) throw new Error("The notation renderer could not load. Refresh and try again.");
+        applyVerovioLayout(false);
+        var loaded = track.musicxmlFormat === "mxl"
+          ? verovioTk.loadZipDataBuffer(xmlBytes.buffer)
+          : verovioTk.loadData(new TextDecoder().decode(xmlBytes));
+        if (loaded === false) throw new Error("The returned MusicXML could not be read.");
+        applyVerovioLayout();
+        verovioNotation.innerHTML = verovioTk.renderToSVG(1);
+        if (!verovioNotation.querySelector("svg")) throw new Error("No score preview was generated.");
+        hasVerovioScore = true;
+        notationViewport.hidden = false;
+        verovioNotation.hidden = false;
+      } catch (err) {
+        notationMessage.textContent = "Recognition preview unavailable. " + err.message;
+        notationMessage.hidden = false;
+      }
+      // A playback/export error must not replace the score with the source image.
+      if (hasVerovioScore) {
+        try { renderedMidi = verovioTk.renderToMIDI(); } catch (err) { /* use backend MIDI */ }
+      }
+      var candidates = [renderedMidi, track.midiBase64].filter(Boolean);
+      for (var i = 0; i < candidates.length && !notes.length; i++) {
+        try {
+          var midiBytes = Uint8Array.from(atob(candidates[i]), function (c) { return c.charCodeAt(0); });
+          midiData = new Midi(midiBytes.buffer);
           notes = collectNotes(midiData);
           totalDuration = midiData.duration;
-          currentNotationPage = 1;
-          hasVerovioScore = false;
-          if (pdfContainer) pdfContainer.hidden = false;
-          if (notationViewport) notationViewport.hidden = true;
-          if (verovioNotation) verovioNotation.hidden = true;
-          if (layoutSection) layoutSection.hidden = true;
-          if (pageNavSection) pageNavSection.hidden = true;
-          if (notationTitle) notationTitle.textContent = "Original Sheet Music";
-          if (track.file && pdfDoc) {
-            renderPdfPage(1);
-          }
-          notationSection.hidden = false;
-          scoreDuration = 0;
-          if (recordBtn) recordBtn.disabled = true;
-          if (stopRecordBtn) stopRecordBtn.disabled = true;
-          if (practiceHint) { practiceHint.hidden = false; practiceHint.textContent = "Practice requires sheet music. This track shows PDF only."; }
-        }
-        return loadInstrument();
+        } catch (err) { /* try the next MIDI source */ }
+      }
+      scoreDuration = hasVerovioScore ? getVerovioScoreDuration() : 0;
+      notationTitle.textContent = "Recognized Sheet Music";
+      notationSection.hidden = false;
+      updatePageNav();
+      playBtn.disabled = notes.length === 0;
+      recordBtn.disabled = !hasVerovioScore || notes.length === 0;
+      stopRecordBtn.disabled = true;
+      practiceHint.hidden = false;
+      practiceHint.textContent = hasVerovioScore
+        ? "Record your playing and compare it to the sheet music."
+        : "Practice requires a recognized sheet music preview.";
+      if (!notes.length) {
+        showError(track.playbackError || "No playable notes found. The recognition result is still available for review.");
+        return;
+      }
+      return loadInstrument().catch(function (err) {
+        playBtn.disabled = true;
+        showError("Playback unavailable: " + err.message + ". The recognition result is still available for review.");
       });
     });
   }
@@ -1616,12 +855,16 @@
     }
     var id = "track-" + (++playlistIdCounter);
     var filename = file.name.replace(/\.(pdf|png|jpg|jpeg)$/i, "");
+    if (ENGINE_LABELS[data.engine]) filename += " — " + ENGINE_LABELS[data.engine];
     var track = {
       id: id,
       filename: filename,
+      engine: data.engine || null,
       midiBase64: data.midi_base64,
+      playbackError: data.playback_error || null,
       musicxmlBase64: data.musicxml_base64 || null,
       musicxmlFormat: data.musicxml_format || null,
+      recognitionReport: data.recognition_report || null,
       measuresPerFirstSystem: data.measures_per_first_system,
       measuresPerLine: data.measures_per_line,
       measureBoundaries: data.measure_boundaries || [],
@@ -1632,38 +875,50 @@
       file: file,
     };
     playlist.push(track);
-    currentTrackId = playlist[0].id;
+    currentTrackId = track.id;
     if (playlistSection) playlistSection.hidden = false;
     renderPlaylist();
+    return track;
   }
 
-  function loadTrack(id) {
+  function loadTrack(id, fromUpload) {
+    if (trackLoading || (uploadBusy && !fromUpload)) return Promise.resolve(false);
     var track = playlist.find(function (t) { return t.id === id; });
-    if (!track) return;
-    if (isPlaying) pause();
+    if (!track) return Promise.resolve(false);
+    stop();
+    trackLoading = true;
+    setUploadControlsDisabled(true);
     clearPracticeFeedback();
     currentTrackId = id;
     renderPlaylist();
     showStatus("Loading track…", "loading");
-    setupTrackFromStoredData(track).then(function () {
+    playerSection.hidden = false;
+    return setupTrackFromStoredData(track).then(function () {
       hideStatus();
       trackNameEl.textContent = track.filename;
       progressBar.style.width = "0%";
       var endTime = scoreDuration > 0 ? scoreDuration : totalDuration;
       progressText.textContent = "0:00 / " + formatTime(endTime);
-      tempoSlider.value = "1";
-      onTempoChange();
       playhead = 0;
       lastPlayedIndex = 0;
+      tempoSlider.value = "1";
+      onTempoChange();
       playerSection.hidden = false;
       if (mainPlaceholder) mainPlaceholder.hidden = true;
+      return true;
     }).catch(function (err) {
       showError(err.message || "Failed to load track");
       hideStatus();
+      // Leave the score visible and allow a sound-loading failure to be retried.
+      return false;
+    }).finally(function () {
+      trackLoading = false;
+      setUploadControlsDisabled(false);
     });
   }
 
   function deleteTrack(id) {
+    if (trackLoading) return;
     var idx = playlist.findIndex(function (t) { return t.id === id; });
     if (idx < 0) return;
     var wasCurrent = playlist[idx].id === currentTrackId;
@@ -1673,14 +928,15 @@
         var nextIdx = Math.min(idx, playlist.length - 1);
         loadTrack(playlist[nextIdx].id);
       } else {
+        stop();
         currentTrackId = null;
         if (playlistSection) playlistSection.hidden = true;
         playerSection.hidden = true;
         if (mainPlaceholder) mainPlaceholder.hidden = false;
-        if (pdfBlobUrl) {
-          URL.revokeObjectURL(pdfBlobUrl);
-          pdfBlobUrl = null;
-        }
+        if (musicxmlBlobUrl) URL.revokeObjectURL(musicxmlBlobUrl);
+        musicxmlBlobUrl = null;
+        musicxmlDownload.hidden = true;
+        musicxmlDownload.removeAttribute("href");
         midiData = null;
         notes = [];
         totalDuration = 0;
@@ -1760,60 +1016,23 @@
     });
   }
 
-  if (pdfOverlay) {
-    pdfOverlay.addEventListener("mousedown", function (e) {
-      if (e.button !== 0 || !currentPdfMeasureRect) return;
-      var r = pdfOverlay.getBoundingClientRect();
-      var x = e.clientX - r.left;
-      var y = e.clientY - r.top;
-      var inside = x >= currentPdfMeasureRect.x &&
-        x <= currentPdfMeasureRect.x + currentPdfMeasureRect.w &&
-        y >= currentPdfMeasureRect.y &&
-        y <= currentPdfMeasureRect.y + currentPdfMeasureRect.h;
-      if (!inside) return;
-      e.preventDefault();
-      overlaySeekDragging = true;
-      handleOverlaySeek(e);
-      function onMove(ev) {
-        if (!overlaySeekDragging) return;
-        handleOverlaySeek(ev);
-      }
-      function onUp() {
-        overlaySeekDragging = false;
-        document.removeEventListener("mousemove", onMove);
-        document.removeEventListener("mouseup", onUp);
-      }
-      document.addEventListener("mousemove", onMove);
-      document.addEventListener("mouseup", onUp);
-    });
-  }
-
-  if (measuresPerLineSelect) {
-    measuresPerLineSelect.addEventListener("change", function () {
-      measuresPerLineMultiplier = parseInt(measuresPerLineSelect.value, 10);
-      if (verovioTk && hasVerovioScore) {
-        applyVerovioLayout();
-        if (verovioNotation) {
-          verovioNotation.innerHTML = verovioTk.renderToSVG(currentNotationPage);
-        }
-        updatePageNav();
-      }
-    });
-  }
-
   if (prevPageBtn) prevPageBtn.addEventListener("click", function () { goToPage(currentNotationPage - 1); });
   if (nextPageBtn) nextPageBtn.addEventListener("click", function () { goToPage(currentNotationPage + 1); });
-  if (viewPdfBtn) viewPdfBtn.addEventListener("click", function () { switchView("pdf"); });
-  if (viewNotationBtn) viewNotationBtn.addEventListener("click", function () { switchView("notation"); });
+
+  // SVG note coordinates change when the responsive score is resized. Keep
+  // the paused marker aligned too, without reactivating it after Stop.
+  window.addEventListener("resize", function () {
+    if (playbackHighlightVisible) updateNotationView(false);
+  });
 
   // Check backend on load (read body once to avoid "stream already read" error)
   fetch((API_URL || window.location.origin) + "/health")
     .then(function (r) { return r.text().then(function (t) { return JSON.parse(t); }); })
     .then(function (data) {
-      if (data.omr_audiveris !== true) {
-        showError("Audiveris is not available. Please install Audiveris (https://audiveris.com/).");
-      } else if (engineSelector) {
-        engineSelector.hidden = false;
+      var availability = document.getElementById("engineAvailability");
+      availability.textContent = "Recognition: HOMR · " + (data.omr_homr ? "ready" : "unavailable");
+      if (!data.omr_homr) {
+        showError("HOMR is unavailable. Install HOMR in the backend environment and initialize its models with homr --init.");
       }
     })
     .catch(function () {
@@ -1859,28 +1078,29 @@
   }
 
   function handleFile(file) {
+    if (uploadBusy) return;
+    if (trackLoading) { showError("Please wait for the score's sound to finish loading."); return; }
     var ext = file.name.toLowerCase().split(".").pop();
     if (!/^(pdf|png|jpg|jpeg)$/.test(ext)) {
       showError("Please select a PDF or image file (PNG, JPG).");
       return;
     }
 
-    if (pdfBlobUrl) {
-      URL.revokeObjectURL(pdfBlobUrl);
-      pdfBlobUrl = null;
-    }
+    uploadBusy = true;
+    setUploadControlsDisabled(true);
+    stop();
 
     hideError();
     showStatus("Uploading file…", "loading");
     playerSection.hidden = true;
-    if (mainPlaceholder) mainPlaceholder.hidden = false;
+    if (mainPlaceholder) mainPlaceholder.hidden = true;
 
     var baseUrl = API_URL || window.location.origin;
     var formData = new FormData();
     formData.append("file", file);
-    formData.append("engine", "audiveris");
+    formData.append("engine", "homr");
 
-    fetch(baseUrl + "/upload", {
+    return fetch(baseUrl + "/upload", {
       method: "POST",
       body: formData,
     })
@@ -1916,56 +1136,19 @@
         return pollUploadStatus(jobId, file, 800);
       })
       .then(function (data) {
-        if (!data.success || !data.midi_base64) {
-          throw new Error("Invalid response from server");
+        if (!data.success || !data.musicxml_base64) {
+          throw new Error(data.playback_error || "HOMR returned no MusicXML.");
         }
-        if (data.musicxml_path) {
-          console.log("MusicXML saved at:", data.musicxml_path);
+        if (data.engine && data.engine !== "homr") {
+          throw new Error("Expected a HOMR result. Refresh the app and check the backend.");
         }
-        showStatus("Ready to play! Loading Euphonium sound…", "loading");
-        var track = {
-          id: null,
-          filename: file.name.replace(/\.(pdf|png|jpg|jpeg)$/i, ""),
-          midiBase64: data.midi_base64,
-          musicxmlBase64: data.musicxml_base64 || null,
-          musicxmlFormat: data.musicxml_format || null,
-          measuresPerFirstSystem: data.measures_per_first_system,
-          measuresPerLine: data.measures_per_line,
-          measureBoundaries: data.measure_boundaries || [],
-          systemTimeRanges: data.system_time_ranges || [],
-          systemRegions: data.system_regions || [],
-          measureLayoutPositions: data.measure_layout_positions || [],
-          measureNotePositions: data.measure_note_positions || [],
-          file: file,
-        };
-        return setupTrackFromStoredData(track).then(function () { return data; });
-      })
-      .then(function (data) {
-        if (notes.length === 0) {
-          throw new Error("No notes found in the sheet music. The PDF may not have been recognized correctly. Try a clearer, higher-resolution image.");
-        }
-        addToPlaylist(data, file);
-        if (playlist.length === 1) {
-          hideStatus();
-          trackNameEl.textContent = playlist[0].filename;
-          progressBar.style.width = "0%";
-          var endTime = scoreDuration > 0 ? scoreDuration : totalDuration;
-          progressText.textContent = "0:00 / " + formatTime(endTime);
-          tempoSlider.value = "1";
-          onTempoChange();
-          playhead = 0;
-          lastPlayedIndex = 0;
-          playerSection.hidden = false;
-          if (mainPlaceholder) mainPlaceholder.hidden = true;
-        } else {
-          loadTrack(playlist[0].id);
-        }
+        // The request explicitly selected HOMR, including with older API responses.
+        data.engine = "homr";
+        var track = addToPlaylist(data, file);
+        if (!track) throw new Error("Playlist is full. Remove a track to add more.");
+        return loadTrack(track.id, true);
       })
       .catch(function (err) {
-        if (pdfBlobUrl) {
-          URL.revokeObjectURL(pdfBlobUrl);
-          pdfBlobUrl = null;
-        }
         var msg = err.message || "Something went wrong.";
         if (msg.includes("Failed to fetch") || msg.includes("NetworkError")) {
           msg = "Could not reach the server. Make sure the backend is running (python -m uvicorn main:app --reload).";
@@ -1978,8 +1161,13 @@
           playerSection.hidden = false;
           if (mainPlaceholder) mainPlaceholder.hidden = true;
         } else if (mainPlaceholder) {
-          mainPlaceholder.textContent = "Upload a PDF to get started";
+          mainPlaceholder.hidden = false;
+          mainPlaceholder.textContent = "Upload sheet music to get started";
         }
+      }).finally(function () {
+        uploadBusy = false;
+        setUploadControlsDisabled(false);
+        fileInput.value = "";
       });
   }
 })();

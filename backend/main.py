@@ -19,6 +19,8 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib_youphonium"))
 
 import base64
+import hashlib
+import json
 import logging
 import time
 import uuid
@@ -38,6 +40,7 @@ from fastapi.staticfiles import StaticFiles
 sys.stderr.write("[YouPhonium] Loading services (converter, omr)...\n")
 sys.stderr.flush()
 from services.converter import musicxml_to_midi
+from services.recognition_quality import analyze_musicxml
 from services.musicxml_layout import (
     get_measure_boundaries,
     get_measure_layout_positions,
@@ -108,11 +111,84 @@ def health():
     oemer_ok = find_oemer_fast()  # Fast check, no heavy import
     return {
         "status": "ok",
+        "app": "YouPhonium",
+        "project_id": hashlib.sha256(str(Path(__file__).resolve().parent.parent).encode()).hexdigest()[:16],
         "omr_audiveris": audiveris_ok,
         "omr_homr": homr_ok,
         "omr_oemer": oemer_ok,
         "audiveris_installed": audiveris_ok,
     }
+
+
+def _recognize_upload(
+    file_path: Path, filename: str, stored_filename: str, engine: Optional[str],
+    is_image: bool, on_progress,
+) -> dict:
+    """Recognize one engine without owning/deleting the shared upload."""
+    engine = engine or "homr"
+    recognize = image_to_musicxml if is_image else pdf_to_musicxml
+    musicxml_path, omr_layout, omr_note_positions = recognize(
+        file_path, original_filename=stored_filename, on_progress=on_progress, engine=engine,
+    )
+    on_progress("Preparing notation…")
+    musicxml_bytes = musicxml_path.read_bytes()
+    report_path = musicxml_path.with_suffix(".recognition.json")
+    recognition_report = (json.loads(report_path.read_text(encoding="utf-8"))
+                          if report_path.exists() else analyze_musicxml(musicxml_path))
+    # Rendering still works if MIDI generation fails. Do not lose an otherwise
+    # useful recognition result just because its rhythm prevents playback.
+    midi_bytes = b""
+    playback_error = None
+    try:
+        on_progress("Converting to MIDI…")
+        midi_bytes = musicxml_to_midi(musicxml_path)
+    except (ValueError, RuntimeError) as exc:
+        playback_error = str(exc)
+    return {
+        "success": True,
+        "engine": engine,
+        "midi_base64": base64.b64encode(midi_bytes).decode("ascii"),
+        "playback_error": playback_error,
+        "musicxml_base64": base64.b64encode(musicxml_bytes).decode("ascii"),
+        "musicxml_format": "mxl" if musicxml_path.suffix.lower() == ".mxl" else "xml",
+        "filename": filename,
+        "recognition_report": recognition_report,
+        "measures_per_first_system": get_measures_per_first_system(musicxml_path),
+        "measures_per_line": get_measures_per_system_for_layout(musicxml_path),
+        "measure_boundaries": get_measure_boundaries(musicxml_path),
+        "system_time_ranges": get_system_time_ranges(musicxml_path),
+        "system_regions": get_system_regions(musicxml_path),
+        "measure_layout_positions": omr_layout or get_measure_layout_positions(musicxml_path),
+        "measure_note_positions": omr_note_positions or [],
+        "musicxml_path": str(musicxml_path.resolve()),
+    }
+
+
+def _run_comparison_job(job_id: str, file_path: Path, filename: str, is_image: bool) -> None:
+    job = _upload_jobs[job_id]
+    engines = {name: {"status": "queued", "message": "Waiting"} for name in ("audiveris", "homr")}
+    job["engines"] = engines
+    # Serialized on purpose: both engines are memory-intensive. Each receives
+    # the same unchanged upload and an engine/job-specific output name.
+    for name in engines:
+        entry = engines[name]
+        entry.update(status="processing", message="Starting…")
+
+        def progress(message: str) -> None:
+            entry["message"] = message
+            job["message"] = f"{name.upper()}: {message}"
+
+        try:
+            stored = f"{Path(filename).stem}__{job_id}__{name}{Path(filename).suffix}"
+            result = _recognize_upload(file_path, filename, stored, name, is_image, progress)
+            entry.update(status="complete", message="Ready", result=result)
+        except Exception as exc:
+            log.exception("%s recognition failed in comparison %s", name, job_id)
+            entry.update(status="error", message="Failed", error=str(exc))
+    completed = sum(e["status"] == "complete" for e in engines.values())
+    job.update(status="complete", message=f"Comparison ready ({completed}/2 engines succeeded)")
+    job["result"] = {"mode": "comparison", "success": completed > 0,
+                     "filename": filename, "engines": engines}
 
 
 def _run_upload_job(
@@ -123,6 +199,10 @@ def _run_upload_job(
     if not job:
         return
     try:
+        engine = engine or "homr"
+        if engine == "compare":
+            _run_comparison_job(job_id, file_path, filename, is_image)
+            return
         def on_progress(msg: str) -> None:
             job["message"] = msg
             job["status"] = "processing"
@@ -130,61 +210,11 @@ def _run_upload_job(
 
         log.info("[Upload %s] Job started for %s (engine=%s, is_image=%s)", job_id[:8], filename, engine or "auto", is_image)
         on_progress("Starting OMR…")
-        if is_image:
-            musicxml_path, omr_layout, omr_note_positions = image_to_musicxml(
-                file_path, original_filename=filename, on_progress=on_progress, engine=engine
-            )
-        else:
-            musicxml_path, omr_layout, omr_note_positions = pdf_to_musicxml(
-                file_path, original_filename=filename, on_progress=on_progress, engine=engine
-            )
-
-        log.info("[Upload %s] OMR complete, converting to MIDI", job_id[:8])
-        on_progress("Converting to MIDI…")
-        midi_bytes = musicxml_to_midi(musicxml_path)
-
-        on_progress("Preparing notation…")
-        # Use raw OMR output for display; music21 normalization can sometimes produce
-        # MusicXML that Verovio renders as title-only/blank (e.g. with HOMR).
-        musicxml_bytes = musicxml_path.read_bytes()
-        musicxml_format = "mxl" if musicxml_path.suffix.lower() == ".mxl" else "xml"
-        measures_per_first_system = get_measures_per_first_system(musicxml_path)
-        measures_per_line = get_measures_per_system_for_layout(musicxml_path)
-        measure_boundaries = get_measure_boundaries(musicxml_path)
-        system_time_ranges = get_system_time_ranges(musicxml_path)
-        system_regions = get_system_regions(musicxml_path)
-        # Prefer OMR layout from Audiveris .omr for precise PDF overlay; fallback to music21
-        measure_layout_positions = (
-            omr_layout if omr_layout else get_measure_layout_positions(musicxml_path)
-        )
-
-        omr_output_dir = Path(__file__).resolve().parent.parent / "omr_output"
-        stem = Path(filename).stem
-        musicxml_saved = omr_output_dir / f"{stem}.mxl"
-        if not musicxml_saved.exists():
-            musicxml_saved = omr_output_dir / f"{stem}.musicxml"
-        if not musicxml_saved.exists():
-            musicxml_saved = omr_output_dir / f"{stem}.xml"
-
+        result = _recognize_upload(file_path, filename, filename, engine, is_image, on_progress)
         job["status"] = "complete"
         job["message"] = "Complete"
-        job["result"] = {
-            "success": True,
-            "midi_base64": base64.b64encode(midi_bytes).decode("ascii"),
-            "musicxml_base64": base64.b64encode(musicxml_bytes).decode("ascii"),
-            "musicxml_format": musicxml_format,
-            "filename": filename,
-            "measures_per_first_system": measures_per_first_system,
-            "measures_per_line": measures_per_line,
-            "measure_boundaries": measure_boundaries,
-            "system_time_ranges": system_time_ranges,
-            "system_regions": system_regions,
-            "measure_layout_positions": measure_layout_positions,
-            "measure_note_positions": omr_note_positions if omr_note_positions else [],
-            "musicxml_path": str(musicxml_saved) if musicxml_saved.exists() else str(omr_output_dir),
-        }
-        if musicxml_path and musicxml_path.exists():
-            log.info("MusicXML kept at: %s", musicxml_path.resolve())
+        job["result"] = result
+        log.info("MusicXML kept at: %s", result["musicxml_path"])
     except FileNotFoundError as e:
         job["status"] = "error"
         job["message"] = "Error"
@@ -210,28 +240,23 @@ def _run_upload_job(
 @app.post("/upload")
 async def upload_pdf(
     file: UploadFile = File(...),
-    engine: Optional[str] = Form(None),
+    engine: Optional[str] = Form("homr"),
     background_tasks: BackgroundTasks = None,
 ):
     """
     Start PDF or image upload and OMR. Returns job_id; poll GET /upload/status/{job_id} for progress.
-    engine: "homr", "oemer", or "audiveris" to force one; omit for auto (Audiveris preferred for PDF).
-    Images (PNG, JPG) only support HOMR and oemer; Audiveris requires PDF.
+    HOMR is the default. Explicit legacy engine/compare requests remain supported for API clients.
     """
     if not file.filename:
         raise HTTPException(400, "Please upload a file")
     ext = file.filename.lower().split(".")[-1] if "." in file.filename else ""
     if ext not in ("pdf", "png", "jpg", "jpeg"):
         raise HTTPException(400, "Please upload a PDF or image file (PNG, JPG)")
-    if engine and engine not in ("homr", "oemer", "audiveris"):
-        raise HTTPException(400, "engine must be 'homr', 'oemer', or 'audiveris'")
+    if engine and engine not in ("homr", "oemer", "audiveris", "compare"):
+        raise HTTPException(400, "engine must be 'compare', 'homr', 'oemer', or 'audiveris'")
+    engine = engine or "homr"
 
     is_image = ext in ("png", "jpg", "jpeg")
-    if is_image and engine == "audiveris":
-        raise HTTPException(
-            400,
-            "Audiveris only supports PDF. Use HOMR or oemer for image files (PNG, JPG).",
-        )
 
     job_id = str(uuid.uuid4())
     _upload_jobs[job_id] = {
@@ -264,6 +289,9 @@ def upload_status(job_id: str):
             "Job not found. The server may have restarted (jobs are in-memory). Please try uploading again.",
         )
     out = {"status": job["status"], "message": job["message"]}
+    if job.get("engines"):
+        out["engines"] = {name: {k: v for k, v in entry.items() if k != "result"}
+                          for name, entry in job["engines"].items()}
     if job.get("started_at"):
         out["started_at"] = job["started_at"]
     if job["status"] == "complete" and job.get("result"):

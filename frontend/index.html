@@ -4,13 +4,13 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>YouPhonium</title>
-  <link rel="stylesheet" href="styles.css?v=2" />
+  <link rel="stylesheet" href="styles.css?v=4" />
 </head>
 <body>
   <div class="app">
     <header>
       <h1>YouPhonium</h1>
-      <p class="subtitle">Upload a PDF, play it in Euphonium sound</p>
+      <p class="subtitle">Upload sheet music, play it in Euphonium sound</p>
     </header>
 
     <main class="main-layout">
@@ -20,12 +20,10 @@
             <input type="file" id="fileInput" accept=".pdf,.png,.jpg,.jpeg" hidden />
             <div class="dropzone-content">
               <span class="dropzone-icon">📄</span>
-              <span class="dropzone-text">Drop PDF or <button type="button" class="btn btn-primary btn-compact" id="browseBtn">Browse</button></span>
+              <span class="dropzone-text">Drop a PDF or image, or <button type="button" class="btn btn-primary btn-compact" id="browseBtn">Browse</button></span>
             </div>
           </div>
-          <div id="engineSelector" class="engine-selector" hidden>
-            <label>OMR engine: Audiveris</label>
-          </div>
+          <p id="engineAvailability" class="upload-hint">Recognition: HOMR · checking availability…</p>
         </section>
 
         <section class="status-section" id="statusSection" hidden>
@@ -52,11 +50,13 @@
       </aside>
 
       <div class="main-content">
-        <p class="main-placeholder" id="mainPlaceholder">Upload a PDF to get started</p>
+        <p class="main-placeholder" id="mainPlaceholder">Upload sheet music to get started</p>
         <section class="player-section" id="playerSection" hidden>
-          <div class="player-card">
+          <section class="notation-section" id="notationSection">
+          <header class="score-header single-score-header">
             <div class="track-info">
               <span id="trackName">—</span>
+              <span id="recognitionEngine" class="recognition-engine">Recognition engine not recorded</span>
             </div>
             <div class="controls">
               <button type="button" class="btn btn-icon" id="playBtn" title="Play">
@@ -78,21 +78,23 @@
               <div class="progress-bar" id="progressBar"></div>
               <span class="progress-text" id="progressText">0:00 / 0:00</span>
             </div>
-          </div>
-          <section class="notation-section" id="notationSection">
             <div class="notation-header">
-              <h3 id="notationTitle">Sheet Music</h3>
+              <h3 id="notationTitle">Recognized Sheet Music</h3>
+              <a id="musicxmlDownload" class="score-download" hidden>Download MusicXML</a>
             </div>
+            <p class="playback-legend">Purple notes and marker show the current playback position.</p>
+          </header>
+            <details class="recognition-review" id="recognitionReview" hidden>
+              <summary id="recognitionSummary">Recognition needs review</summary>
+              <p id="recognitionNotice"></p>
+              <ul id="recognitionIssues"></ul>
+            </details>
             <div class="notation-wrapper" id="notationWrapper">
+              <p id="notationMessage" class="notation-message" role="status" hidden></p>
               <div class="notation-viewport" id="notationViewport">
                 <div id="measureHighlight" class="measure-highlight" aria-hidden="true"></div>
+                <div id="playbackCursor" class="playback-cursor" aria-hidden="true" hidden></div>
                 <div id="verovioNotation" class="verovio-notation" hidden></div>
-              </div>
-              <div class="pdf-container" id="pdfContainer" hidden>
-                <div class="pdf-canvas-wrapper">
-                  <canvas id="pdfCanvas"></canvas>
-                  <canvas id="pdfOverlay" class="pdf-overlay" aria-hidden="true"></canvas>
-                </div>
               </div>
             </div>
             <div class="page-nav-section" id="pageNavSection" hidden>
@@ -110,14 +112,13 @@
     </main>
 
     <footer>
-      <p>Uses <a href="https://audiveris.com/" target="_blank" rel="noopener">Audiveris</a> for PDF recognition</p>
+      <p>Sheet music recognition powered by <a href="https://github.com/liebharc/homr" target="_blank" rel="noopener">HOMR</a></p>
     </footer>
   </div>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/build/Midi.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/soundfont-player@0.12.0/dist/soundfont-player.min.js"></script>
   <script src="https://www.verovio.org/javascript/develop/verovio-toolkit-wasm.js" defer></script>
-  <script src="app.js" defer></script>
+  <script src="app.js?v=4" defer></script>
 </body>
 </html>

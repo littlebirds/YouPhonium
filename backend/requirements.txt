@@ -3,6 +3,8 @@ uvicorn[standard]>=0.24.0
 music21>=8.0.0
 python-multipart>=0.0.6
 pymupdf>=1.23.0
+Pillow>=10.0.0
+numpy>=1.24.0
 homr>=0.6.0
 # basic-pitch: optional, for Practice mode (audio transcription). Currently incompatible:
 # tensorflow-macos<2.15.1 required but only 2.16.x available. Uncomment when fixed:

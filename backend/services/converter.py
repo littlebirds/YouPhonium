@@ -1,8 +1,8 @@
 """Convert MusicXML to MIDI using music21.
 
 Playback priorities (see PLAN.md): Pitches and rhythm are essential; dynamics
-and grace notes are optional. Post-processing focuses on rhythm fixes
-(_fix_eighth_as_quarter, _normalize_durations) and fails when note count is zero.
+and grace notes are optional. Conversion preserves the recognized rhythm;
+structural problems are reported separately, never fixed by guessing durations.
 """
 
 import copy
@@ -326,10 +326,9 @@ def musicxml_to_midi(musicxml_path: Path) -> bytes:
             "Try a different OMR engine (Audiveris, HOMR, oemer) or use a clearer, higher-resolution image."
         )
 
-    _fix_false_augmentation_dots(score)
-    _fix_eighth_as_quarter(score)
-    _normalize_durations(score)
-    _set_euphonium_header(score)
+    # Keep tuplets, dotted notes, rests and simultaneous voices exactly as
+    # encoded. Rounding/squeezing bars silently changed valid rhythms and made
+    # backend playback disagree with the MusicXML shown by Verovio.
 
     try:
         mf = m21_midi.translate.streamToMidiFile(score)
@@ -345,8 +344,8 @@ def musicxml_to_midi(musicxml_path: Path) -> bytes:
 
 def musicxml_to_normalized_musicxml(musicxml_path: Path) -> Tuple[bytes, str]:
     """
-    Parse MusicXML, normalize durations (fix quarter/eighth OMR errors), return normalized bytes.
-    Use this for the MusicXML sent to the frontend so Verovio displays/plays corrected durations.
+    Re-serialize MusicXML without speculative pitch, rhythm or part-name changes.
+    Kept under its historical name for callers; this is not an OMR repair step.
     Always outputs uncompressed XML for compatibility.
     """
     m21_converter, _, _, _ = _music21()
@@ -354,10 +353,6 @@ def musicxml_to_normalized_musicxml(musicxml_path: Path) -> Tuple[bytes, str]:
         score = m21_converter.parse(str(musicxml_path))
     except Exception as e:
         raise ValueError(f"Failed to parse MusicXML: {e}") from e
-    _fix_false_augmentation_dots(score)
-    _fix_eighth_as_quarter(score)
-    _normalize_durations(score)
-    _set_euphonium_header(score)
 
     with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
         tmp_path = Path(tmp.name)
