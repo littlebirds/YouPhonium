@@ -10,6 +10,7 @@ import zipfile
 from PIL import Image, ImageDraw
 
 from services.recognition_quality import analyze_musicxml, quality_cost, read_musicxml
+from services.musicxml_editor import edit_marker
 from services.score_image import prepare_score_image, staff_spacing, load_score_image
 from services.audiveris_recovery import prepare_wedge_recovery
 from services import omr
@@ -76,6 +77,73 @@ class RecognitionTests(unittest.TestCase):
     def test_missing_and_duplicate_measure_numbers(self):
         report = analyze_musicxml(self.xml(score(two_staff_bar(1) + two_staff_bar(3) + two_staff_bar(3))))
         self.assertEqual(report["issue_counts"], {"measure_gap": 1, "measure_number": 1})
+
+    def test_unmatched_repeat_markers_are_reported(self):
+        backward = '<barline location="right"><repeat direction="backward"/></barline>'
+        path = self.xml(score(two_staff_bar(1) + two_staff_bar(2)))
+        root = ET.parse(path)
+        root.find(".//measure[@number='2']").append(ET.fromstring(backward))
+        root.write(path)
+
+        report = analyze_musicxml(path)
+
+        self.assertEqual(report["issue_counts"]["repeat_unmatched_backward"], 1)
+        self.assertIn("return to the beginning", report["issues"][-1]["message"])
+
+    def test_matched_repeat_and_volta_markers_are_balanced(self):
+        path = self.xml(score(two_staff_bar(1) + two_staff_bar(2) + two_staff_bar(3)))
+        edit_marker(path, "1", "add_forward_repeat")
+        edit_marker(path, "2", "add_ending_start", "1")
+        edit_marker(path, "2", "add_ending_stop", "1")
+        edit_marker(path, "2", "add_backward_repeat")
+        edit_marker(path, "3", "add_ending_start", "2")
+        edit_marker(path, "3", "add_ending_discontinue", "2")
+
+        report = analyze_musicxml(path)
+
+        self.assertFalse(any(item["code"].startswith(("repeat_", "ending_"))
+                             for item in report["issues"]))
+        edited = read_musicxml(path)
+        first = edited.find(".//measure[@number='1']/barline/repeat")
+        second = edited.find(".//measure[@number='2']/barline/repeat")
+        self.assertEqual((first.get("direction"), second.get("direction")), ("forward", "backward"))
+
+    def test_midi_expands_repeat_and_skips_first_ending_on_second_pass(self):
+        path = self.xml(score(
+            bar(pitched("C"), 1)
+            + bar(pitched("D"), 2, attributes=False)
+            + bar(pitched("E"), 3, attributes=False)
+        ))
+        edit_marker(path, "1", "add_forward_repeat")
+        edit_marker(path, "2", "add_ending_start", "1")
+        edit_marker(path, "2", "add_ending_stop", "1")
+        edit_marker(path, "2", "add_backward_repeat")
+        edit_marker(path, "3", "add_ending_start", "2")
+        edit_marker(path, "3", "add_ending_stop", "2")
+
+        from music21 import midi
+        from services.converter import musicxml_to_midi
+        from services.musicxml_layout import get_playback_time_map
+        mf = midi.MidiFile()
+        mf.readstr(musicxml_to_midi(path))
+        performed = midi.translate.midiFileToStream(mf, quantizePost=False)
+        pitches = [item.pitch.name for item in performed.recurse().notes]
+
+        self.assertEqual(pitches, ["C", "D", "C", "E"])
+        timeline = get_playback_time_map(path)
+        self.assertEqual([item["measure_index"] for item in timeline], [0, 1, 0, 2])
+        self.assertEqual([item["score_start"] for item in timeline], [0.0, 2.0, 0.0, 4.0])
+        right_barline = read_musicxml(path).find(".//measure[@number='2']/barline[@location='right']")
+        self.assertEqual([child.tag for child in right_barline], ["ending", "repeat"])
+
+    def test_marker_removal_is_idempotent(self):
+        path = self.xml(score(two_staff_bar(1)))
+        self.assertEqual(edit_marker(path, "1", "add_forward_repeat"), 1)
+        self.assertEqual(edit_marker(path, "1", "add_forward_repeat"), 0)
+        self.assertEqual(edit_marker(path, "1", "remove_forward_repeat"), 1)
+        self.assertEqual(edit_marker(path, "1", "remove_forward_repeat"), 0)
+        with self.assertRaisesRegex(ValueError, "Measure 99 was not found"):
+            edit_marker(path, "99", "add_backward_repeat")
 
     def test_tuplets_dots_and_multiple_voices(self):
         triplet = '<time-modification><actual-notes>3</actual-notes><normal-notes>2</normal-notes></time-modification>'

@@ -26,7 +26,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Literal, Optional
 
 sys.stderr.write("[YouPhonium] Loading FastAPI...\n")
 sys.stderr.flush()
@@ -37,13 +37,16 @@ log = logging.getLogger(__name__)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 sys.stderr.write("[YouPhonium] Loading services (converter, omr)...\n")
 sys.stderr.flush()
 from services.converter import musicxml_to_midi
-from services.recognition_quality import analyze_musicxml
+from services.recognition_quality import analyze_musicxml, read_musicxml
+from services.musicxml_editor import apply_marker_edits
 from services.musicxml_layout import (
     get_measure_boundaries,
+    get_playback_time_map,
     get_measure_layout_positions,
     get_measures_per_first_system,
     get_measures_per_system_for_layout,
@@ -186,12 +189,18 @@ def _result_from_musicxml(path: Path, filename: Optional[str] = None,
     report_path = path.with_suffix(".recognition.json")
     recognition_report = (json.loads(report_path.read_text(encoding="utf-8"))
                           if report_path.exists() else analyze_musicxml(path))
+    if recognition_report.get("validator_version") != 2:
+        recognition_report = _refresh_recognition_report(path)
     midi_bytes = b""
     playback_error = None
     try:
         midi_bytes = musicxml_to_midi(path)
     except (ValueError, RuntimeError) as exc:
         playback_error = str(exc)
+    first_part = read_musicxml(path).find("part")
+    measure_numbers = ([measure.get("number", str(index + 1))
+                        for index, measure in enumerate(first_part.findall("measure"))]
+                       if first_part is not None else [])
     return {
         "success": True,
         "library_id": _library_id(path),
@@ -205,12 +214,48 @@ def _result_from_musicxml(path: Path, filename: Optional[str] = None,
         "measures_per_first_system": get_measures_per_first_system(path),
         "measures_per_line": get_measures_per_system_for_layout(path),
         "measure_boundaries": get_measure_boundaries(path),
+        "playback_time_map": get_playback_time_map(path),
         "system_time_ranges": get_system_time_ranges(path),
         "system_regions": get_system_regions(path),
         "measure_layout_positions": get_measure_layout_positions(path),
         "measure_note_positions": [],
+        "measure_numbers": measure_numbers,
         "musicxml_path": str(path.resolve()),
     }
+
+
+class MusicXmlMarkerEdit(BaseModel):
+    measure: str = Field(min_length=1, max_length=20)
+    action: Literal[
+        "add_forward_repeat", "add_backward_repeat",
+        "remove_forward_repeat", "remove_backward_repeat",
+        "add_ending_start", "add_ending_stop", "add_ending_discontinue",
+        "remove_endings",
+    ]
+    ending_number: Optional[str] = Field(default=None, min_length=1, max_length=12)
+
+
+class MusicXmlEditBatch(BaseModel):
+    edits: list[MusicXmlMarkerEdit] = Field(min_length=1, max_length=100)
+
+
+def _refresh_recognition_report(path: Path) -> dict:
+    """Re-run structural checks without losing OMR/layout provenance."""
+    report_path = path.with_suffix(".recognition.json")
+    previous = {}
+    if report_path.exists():
+        try:
+            previous = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+    report = analyze_musicxml(path)
+    generated_keys = {
+        "validator_version", "status", "measure_count", "pitched_note_count", "has_encoded_breaks",
+        "issues", "issue_counts", "notice",
+    }
+    report.update({key: value for key, value in previous.items() if key not in generated_keys})
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
 
 app = FastAPI(title="YouPhonium API", lifespan=lifespan)
 
@@ -286,6 +331,7 @@ def _recognize_upload(
         "measures_per_first_system": get_measures_per_first_system(musicxml_path),
         "measures_per_line": get_measures_per_system_for_layout(musicxml_path),
         "measure_boundaries": get_measure_boundaries(musicxml_path),
+        "playback_time_map": get_playback_time_map(musicxml_path),
         "system_time_ranges": get_system_time_ranges(musicxml_path),
         "system_regions": get_system_regions(musicxml_path),
         "measure_layout_positions": omr_layout or get_measure_layout_positions(musicxml_path),
@@ -468,6 +514,48 @@ def list_library():
 def get_library_item(item_id: str):
     """Load notation, playback, and review data for one shared score."""
     return _result_from_musicxml(_library_path(item_id))
+
+
+@app.post("/library/{item_id}/validate")
+def validate_library_item(item_id: str):
+    """Run semantic validation on demand without changing the MusicXML."""
+    path = _library_path(item_id)
+    with _library_write_lock:
+        report = _refresh_recognition_report(path)
+    return {"success": True, "recognition_report": report}
+
+
+@app.post("/library/{item_id}/edit-preview")
+def preview_library_edits(item_id: str, batch: MusicXmlEditBatch):
+    """Render staged marker edits without writing the shared score."""
+    path = _library_path(item_id)
+    try:
+        changed, xml = apply_marker_edits(
+            path, [edit.model_dump() for edit in batch.edits], save=False)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {
+        "success": True,
+        "edit_changed": changed,
+        "musicxml_base64": base64.b64encode(xml).decode("ascii"),
+        "musicxml_format": "xml",
+    }
+
+
+@app.post("/library/{item_id}/edit-batch")
+def save_library_edits(item_id: str, batch: MusicXmlEditBatch):
+    """Commit a set of previewed marker edits in one explicit save."""
+    path = _library_path(item_id)
+    try:
+        with _library_write_lock:
+            changed, _ = apply_marker_edits(
+                path, [edit.model_dump() for edit in batch.edits], save=True)
+            _refresh_recognition_report(path)
+            result = _result_from_musicxml(path)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    result["edit_changed"] = changed
+    return result
 
 
 @app.delete("/library/{item_id}")

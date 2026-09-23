@@ -4,13 +4,13 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>YouPhonium</title>
-  <link rel="stylesheet" href="styles.css?v=4" />
+  <link rel="stylesheet" href="styles.css?v=11" />
 </head>
 <body>
   <div class="app">
     <header>
       <h1>YouPhonium</h1>
-      <p class="subtitle">Upload sheet music, play it in Euphonium sound</p>
+      <p class="subtitle">Scan sheet music, play it in the instrument you like!</p>
     </header>
 
     <main class="main-layout">
@@ -54,10 +54,6 @@
         <section class="player-section" id="playerSection" hidden>
           <section class="notation-section" id="notationSection">
           <header class="score-header single-score-header">
-            <div class="track-info">
-              <span id="trackName">—</span>
-              <span id="recognitionEngine" class="recognition-engine">Recognition engine not recorded</span>
-            </div>
             <div class="controls">
               <button type="button" class="btn btn-icon" id="playBtn" title="Play">
                 <span class="icon">▶</span>
@@ -79,11 +75,52 @@
               <span class="progress-text" id="progressText">0:00 / 0:00</span>
             </div>
             <div class="notation-header">
-              <h3 id="notationTitle">Recognized Sheet Music</h3>
-              <a id="musicxmlDownload" class="score-download" hidden>Download MusicXML</a>
+              <h3 id="notationTitle">Score</h3>
+              <div class="score-actions">
+                <span class="validation-status" id="validationStatus" role="status" aria-live="polite"></span>
+                <button type="button" class="score-edit-toggle score-validate-btn" id="scoreValidateBtn" hidden>Validate</button>
+                <button type="button" class="score-edit-toggle" id="scoreEditBtn" aria-expanded="false" aria-label="Fix"
+                  data-tooltip="Click a measure in the score or type its number, then choose a correction. The preview updates immediately; nothing is stored until you save."
+                  hidden>Fix</button>
+                <a id="musicxmlDownload" class="score-download" hidden>Download MusicXML</a>
+                <a id="midiDownload" class="score-download" hidden>Export to MIDI</a>
+              </div>
             </div>
             <p class="playback-legend">Purple notes and marker show the current playback position.</p>
           </header>
+            <section class="score-editor" id="scoreEditor" aria-label="MusicXML corrections" hidden>
+              <div class="score-editor-grid">
+                <button type="button" class="score-editor-drag-handle" id="scoreEditorDragHandle"
+                  aria-label="Drag correction toolbar" title="Drag to move">⠿</button>
+                <input class="measure-field" id="editMeasure" type="text" value="" placeholder="Measure"
+                  inputmode="numeric" autocomplete="off" aria-label="Selected measure" />
+                <div class="editor-tool-group" role="group" aria-label="Repeat barline">
+                  <span class="tool-group-label">Repeat</span>
+                  <div class="editor-button-row">
+                    <button type="button" class="marker-tool" data-edit-action="add_forward_repeat"><span class="marker-glyph">|:</span> Add forward</button>
+                    <button type="button" class="marker-tool" data-edit-action="add_backward_repeat"><span class="marker-glyph">:|</span> Add backward</button>
+                    <button type="button" class="marker-tool marker-tool-muted" data-edit-action="remove_forward_repeat">Remove forward</button>
+                    <button type="button" class="marker-tool marker-tool-muted" data-edit-action="remove_backward_repeat">Remove backward</button>
+                  </div>
+                </div>
+                <div class="editor-tool-group ending-tools" role="group" aria-label="Volta bracket">
+                  <span class="tool-group-label">Volta</span>
+                  <select id="editEndingNumber" aria-label="Ending"><option value="1">1st</option><option value="2">2nd</option></select>
+                  <div class="editor-button-row">
+                    <button type="button" class="marker-tool" data-edit-action="add_ending_start">Start bracket</button>
+                    <button type="button" class="marker-tool" data-edit-action="add_ending_stop">Close bracket</button>
+                    <button type="button" class="marker-tool" data-edit-action="add_ending_discontinue">Open-ended close</button>
+                    <button type="button" class="marker-tool marker-tool-muted" data-edit-action="remove_endings">Remove bracket mark</button>
+                  </div>
+                </div>
+                <div class="score-editor-commit">
+                  <button type="button" class="editor-cancel-btn" id="scoreEditorCancel">Cancel</button>
+                  <button type="button" class="editor-save-btn" id="scoreEditorSave" disabled>Save changes</button>
+                </div>
+                <p class="score-editor-status" id="scoreEditorStatus" role="status" aria-live="polite"></p>
+                <button type="button" class="score-editor-close" id="scoreEditorClose" aria-label="Close score editor" title="Close">×</button>
+              </div>
+            </section>
             <details class="recognition-review" id="recognitionReview" hidden>
               <summary id="recognitionSummary">Recognition needs review</summary>
               <p id="recognitionNotice"></p>
@@ -93,6 +130,8 @@
               <p id="notationMessage" class="notation-message" role="status" hidden></p>
               <div class="notation-viewport" id="notationViewport">
                 <div id="measureHighlight" class="measure-highlight" aria-hidden="true"></div>
+                <div id="editMeasureSelection" class="edit-measure-selection" aria-hidden="true" hidden></div>
+                <div id="endingStartPreview" class="ending-start-preview" aria-hidden="true" hidden></div>
                 <div id="playbackCursor" class="playback-cursor" aria-hidden="true" hidden></div>
                 <div id="verovioNotation" class="verovio-notation" hidden></div>
               </div>
@@ -119,6 +158,6 @@
   <script src="https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/build/Midi.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/soundfont-player@0.12.0/dist/soundfont-player.min.js"></script>
   <script src="https://www.verovio.org/javascript/develop/verovio-toolkit-wasm.js" defer></script>
-  <script src="app.js?v=6" defer></script>
+  <script src="app.js?v=15" defer></script>
 </body>
 </html>

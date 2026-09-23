@@ -330,8 +330,19 @@ def musicxml_to_midi(musicxml_path: Path) -> bytes:
     # encoded. Rounding/squeezing bars silently changed valid rhythms and made
     # backend playback disagree with the MusicXML shown by Verovio.
 
+    # MIDI has no repeat/volta control-flow instructions. Expand the written
+    # structure into its performed order before translating, otherwise a
+    # backward repeat can be ignored or interpreted differently by clients.
+    playback_score = score
     try:
-        mf = m21_midi.translate.streamToMidiFile(score)
+        playback_score = score.expandRepeats()
+    except Exception as exc:
+        # Recognition validation reports malformed repeat structures. Retain
+        # linear playback as a safe fallback instead of losing MIDI entirely.
+        log.warning("[converter] Could not expand repeats; using written order: %s", exc)
+
+    try:
+        mf = m21_midi.translate.streamToMidiFile(playback_score)
         midi_stream = io.BytesIO()
         mf.openFileLike(midi_stream)
         mf.write()

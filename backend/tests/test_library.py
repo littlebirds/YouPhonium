@@ -1,5 +1,6 @@
 """Shared output-library and upload de-duplication regressions."""
 
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -70,6 +71,51 @@ class LibraryTests(unittest.TestCase):
         self.assertFalse(selected.with_suffix('.recognition.json').exists())
         self.assertFalse(selected.with_suffix('.library.json').exists())
         self.assertTrue(keep.exists())
+
+    def test_library_marker_edit_saves_xml_and_refreshes_warnings(self):
+        selected = self.add_score('March--a7937b64.musicxml', 'March.pdf', 'abc')
+        selected.with_suffix('.recognition.json').write_text(json.dumps({
+            'issues': [], 'source_layout': {'preserved': True},
+        }))
+        item_id = main._library_id(selected)
+
+        batch = main.MusicXmlEditBatch(edits=[main.MusicXmlMarkerEdit(
+            measure='1', action='add_backward_repeat')])
+        with patch.object(main, 'musicxml_to_midi', return_value=b''):
+            main.save_library_edits(item_id, batch)
+
+        xml = selected.read_text()
+        self.assertIn('repeat direction="backward"', xml)
+        report = json.loads(selected.with_suffix('.recognition.json').read_text())
+        self.assertEqual(report['issue_counts']['repeat_unmatched_backward'], 1)
+        self.assertEqual(report['source_layout'], {'preserved': True})
+
+    def test_library_validation_refreshes_report_without_editing_score(self):
+        selected = self.add_score('March--a7937b64.musicxml', 'March.pdf', 'abc')
+        before = selected.read_bytes()
+
+        result = main.validate_library_item(main._library_id(selected))
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['recognition_report']['validator_version'], 2)
+        self.assertEqual(selected.read_bytes(), before)
+        self.assertTrue(selected.with_suffix('.recognition.json').exists())
+
+    def test_marker_preview_is_not_saved_until_batch_commit(self):
+        selected = self.add_score('March--a7937b64.musicxml', 'March.pdf', 'abc')
+        item_id = main._library_id(selected)
+        before = selected.read_bytes()
+        batch = main.MusicXmlEditBatch(edits=[main.MusicXmlMarkerEdit(
+            measure='1', action='add_forward_repeat')])
+
+        preview = main.preview_library_edits(item_id, batch)
+
+        self.assertEqual(selected.read_bytes(), before)
+        self.assertIn(b'repeat direction="forward"', base64.b64decode(preview['musicxml_base64']))
+        with patch.object(main, 'musicxml_to_midi', return_value=b''):
+            saved = main.save_library_edits(item_id, batch)
+        self.assertEqual(saved['edit_changed'], 1)
+        self.assertIn(b'repeat direction="forward"', selected.read_bytes())
 
     def test_upload_job_reuses_exact_duplicate_without_running_omr(self):
         content = b'same source bytes'

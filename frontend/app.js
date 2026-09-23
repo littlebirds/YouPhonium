@@ -11,9 +11,6 @@
   const statusSection = document.getElementById("statusSection");
   const statusEl = document.getElementById("status");
   const playerSection = document.getElementById("playerSection");
-  const trackNameEl = document.getElementById("trackName");
-  const recognitionEngineEl = document.getElementById("recognitionEngine");
-  const ENGINE_LABELS = { audiveris: "Audiveris", homr: "HOMR", oemer: "oemer" };
   const playBtn = document.getElementById("playBtn");
   const pauseBtn = document.getElementById("pauseBtn");
   const stopBtn = document.getElementById("stopBtn");
@@ -46,12 +43,31 @@
   const notationViewport = document.getElementById("notationViewport");
   const recognitionReview = document.getElementById("recognitionReview");
   let musicxmlBlobUrl = null;
+  let midiBlobUrl = null;
   const musicxmlDownload = document.getElementById("musicxmlDownload");
+  const midiDownload = document.getElementById("midiDownload");
   const notationMessage = document.getElementById("notationMessage");
+  const scoreValidateBtn = document.getElementById("scoreValidateBtn");
+  const validationStatus = document.getElementById("validationStatus");
+  const scoreEditBtn = document.getElementById("scoreEditBtn");
+  const scoreEditor = document.getElementById("scoreEditor");
+  const scoreEditorDragHandle = document.getElementById("scoreEditorDragHandle");
+  const scoreEditorClose = document.getElementById("scoreEditorClose");
+  const editMeasure = document.getElementById("editMeasure");
+  const editEndingNumber = document.getElementById("editEndingNumber");
+  const scoreEditorStatus = document.getElementById("scoreEditorStatus");
+  const scoreEditorCancel = document.getElementById("scoreEditorCancel");
+  const scoreEditorSave = document.getElementById("scoreEditorSave");
+  const editMeasureSelection = document.getElementById("editMeasureSelection");
+  const endingStartPreview = document.getElementById("endingStartPreview");
 
   let playlist = [];
   let currentTrackId = null;
   let playlistIdCounter = 0;
+  let pendingMusicXmlEdits = [];
+  let selectedEditMeasure = null;
+  let pendingEndingStart = null;
+  let scoreEditorManuallyPositioned = false;
 
   let audioContext = null;
   let instrument = null;
@@ -68,6 +84,7 @@
   let verovioTk = null;
   let verovioReady = null;
   let currentNotationPage = 1;
+  let notationPageManuallySelected = false;
   let hasVerovioScore = false;
   let playbackHighlightVisible = false;
   let followedSystem = null;
@@ -153,13 +170,10 @@
     if (!verovioTk || !hasVerovioScore) return;
     var total = verovioTk.getPageCount();
     currentNotationPage = Math.max(1, Math.min(total, pageNum));
+    notationPageManuallySelected = true;
     clearVerovioHighlights();
     verovioNotation.innerHTML = verovioTk.renderToSVG(currentNotationPage);
-    var firstNote = verovioNotation.querySelector("g.note[id]");
-    if (firstNote && typeof verovioTk.getTimeForElement === "function") {
-      var time = verovioTk.getTimeForElement(firstNote.id);
-      if (Number.isFinite(time) && time >= 0) seekTo(time / 1000);
-    }
+    restoreEditMeasureSelection();
     updatePageNav();
   }
 
@@ -177,15 +191,36 @@
     return Math.min(totalDuration, lastValidSec + stepSec);
   }
 
+  function notationTimeForPlayback(playbackSeconds) {
+    var track = currentTrackForLayout;
+    var timeline = track && track.playbackTimeMap;
+    if (!timeline || !timeline.length) return playbackSeconds;
+    for (var i = 0; i < timeline.length; i++) {
+      var segment = timeline[i];
+      var isLast = i === timeline.length - 1;
+      if (playbackSeconds < segment.playback_start) break;
+      if (playbackSeconds < segment.playback_end || isLast) {
+        var playbackLength = segment.playback_end - segment.playback_start;
+        var scoreLength = segment.score_end - segment.score_start;
+        var progress = playbackLength > 0
+          ? Math.max(0, Math.min(1, (playbackSeconds - segment.playback_start) / playbackLength))
+          : 0;
+        return segment.score_start + progress * scoreLength;
+      }
+    }
+    return playbackSeconds;
+  }
+
   function updateNotationView(followPlayback) {
     if (!hasVerovioScore || !verovioTk) return;
     playbackHighlightVisible = true;
     var track = currentTrackForLayout;
-    var timeMs = playhead * 1000;
+    var notationTime = notationTimeForPlayback(playhead);
+    var timeMs = notationTime * 1000;
     var currentElements = verovioTk.getElementsAtTime(timeMs);
     var targetPage = currentNotationPage;
 
-    if (currentElements && currentElements.page && currentElements.page !== 0) {
+    if (!notationPageManuallySelected && currentElements && currentElements.page && currentElements.page !== 0) {
       targetPage = currentElements.page;
     }
 
@@ -196,6 +231,8 @@
       }
       updatePageNav();
     }
+    var cursorPageVisible = !(notationPageManuallySelected && currentElements
+      && currentElements.page && currentElements.page !== currentNotationPage);
 
     if (verovioNotation) {
       var playingNotes = verovioNotation.querySelectorAll("g.note.playing, [data-playing]");
@@ -213,8 +250,10 @@
       }
       var measureEl = null;
       var cursorNote = null;
+      var measureProgress = null;
       var latestOnset = -Infinity;
-      var hasPlayingNotes = currentElements && currentElements.notes && currentElements.notes.length;
+      var hasPlayingNotes = cursorPageVisible && currentElements
+        && currentElements.notes && currentElements.notes.length;
       if (hasPlayingNotes) {
         currentElements.notes.forEach(function (id) {
           var note = verovioNotation.querySelector("#" + CSS.escape(id));
@@ -231,10 +270,16 @@
         });
         measureEl = cursorNote && cursorNote.closest("g.measure");
       }
-      if (!measureEl && currentElements && track && track.measureBoundaries) {
+      if (!measureEl && cursorPageVisible && currentElements && track && track.measureBoundaries) {
         var boundaries = track.measureBoundaries;
         for (var b = 0; b < boundaries.length; b++) {
-          if (playhead >= boundaries[b][0] && playhead < boundaries[b][1]) {
+          var atFinalBoundary = b === boundaries.length - 1 && notationTime === boundaries[b][1];
+          if (notationTime >= boundaries[b][0]
+              && (notationTime < boundaries[b][1] || atFinalBoundary)) {
+            var boundaryDuration = boundaries[b][1] - boundaries[b][0];
+            measureProgress = boundaryDuration > 0
+              ? Math.max(0, Math.min(1, (notationTime - boundaries[b][0]) / boundaryDuration))
+              : 0;
             var sampleMs = (boundaries[b][0] + 0.05) * 1000;
             var sampleEl = verovioTk.getElementsAtTime(sampleMs);
             if (sampleEl && sampleEl.notes && sampleEl.notes.length) {
@@ -259,6 +304,11 @@
             var nRect = notehead.getBoundingClientRect();
             playbackCursor.hidden = false;
             playbackCursor.style.left = (nRect.left + nRect.width / 2 - vpRect.left) + "px";
+            playbackCursor.style.top = (mRect.top - vpRect.top) + "px";
+            playbackCursor.style.height = mRect.height + "px";
+          } else if (playbackCursor && measureProgress != null) {
+            playbackCursor.hidden = false;
+            playbackCursor.style.left = (mRect.left + mRect.width * measureProgress - vpRect.left) + "px";
             playbackCursor.style.top = (mRect.top - vpRect.top) + "px";
             playbackCursor.style.height = mRect.height + "px";
           } else if (playbackCursor) {
@@ -373,7 +423,7 @@
     var correctColor = "rgb(34, 197, 94)";  /* green for agreed notes */
     var errorColor = "rgb(239, 68, 68)";    /* red for wrong or missed notes */
     for (var i = 0; i < notes.length; i++) {
-      var timeMs = notes[i].time * 1000;
+      var timeMs = notationTimeForPlayback(notes[i].time) * 1000;
       var el = verovioTk.getElementsAtTime(timeMs);
       if (!el || !el.notes) continue;
       var noteIds = el.notes;
@@ -665,6 +715,7 @@
     if (instrument) instrument.stop();
     progressBar.style.width = (playhead / endTime) * 100 + "%";
     progressText.textContent = formatTime(playhead) + " / " + formatTime(endTime);
+    notationPageManuallySelected = false;
     updateNotationView();
     if (isPlaying) {
       startRealTime = performance.now() - (playhead / tempo) * 1000;
@@ -681,14 +732,62 @@
     seekTo(ratio * endTime);
   }
 
+  function renderRecognitionReview(track, openWhenIssues) {
+    if (!recognitionReview) return;
+    var report = track && track.recognitionReport;
+    recognitionReview.hidden = !report;
+    recognitionReview.open = !!(openWhenIssues && report && (report.issues || []).length);
+    if (!report) return;
+    var issues = report.issues || [];
+    var sourceLayout = report.source_layout;
+    var warnings = (report.export_warnings || []).concat(sourceLayout ? (sourceLayout.warnings || []) : []);
+    var numbers = Array.from(new Set(issues.map(function (i) { return i.measure; })));
+    var hasRepeatIssue = issues.some(function (item) {
+      return item.code && (item.code.indexOf("repeat_") === 0 || item.code.indexOf("ending_") === 0);
+    });
+    document.getElementById("recognitionSummary").textContent = numbers.length
+      ? "Check measures " + numbers.join(", ") + (hasRepeatIssue
+        ? " — repeat structure may be incomplete"
+        : " — recognition may be incomplete")
+      : (warnings.length ? "Recognition export required recovery — review details" : "Semantic validation passed — continue visual review");
+    document.getElementById("recognitionNotice").textContent = report.notice || "Review the automatic transcription against your source file.";
+    if (sourceLayout && sourceLayout.preserved) {
+      document.getElementById("recognitionNotice").textContent += " Source layout preserved: "
+        + sourceLayout.systems.length + " systems; staves per system: "
+        + sourceLayout.systems.map(function (s) { return s.staff_count; }).join(", ")
+        + "; measures per system: " + sourceLayout.systems.map(function (s) { return s.measure_count; }).join(", ") + ".";
+    }
+    var issueList = document.getElementById("recognitionIssues");
+    issueList.replaceChildren();
+    warnings.concat(issues.map(function (i) { return i.message; })).forEach(function (message) {
+      var item = document.createElement("li");
+      item.textContent = message;
+      issueList.appendChild(item);
+    });
+  }
+
   function setupTrackFromStoredData(track) {
-    // Keep the engine associated with the result, including older playlist entries.
-    if (recognitionEngineEl) recognitionEngineEl.textContent = ENGINE_LABELS[track.engine]
-      ? "Recognized by " + ENGINE_LABELS[track.engine] : "Recognition engine not recorded";
+    pendingMusicXmlEdits = [];
+    selectedEditMeasure = null;
+    pendingEndingStart = null;
+    if (editMeasureSelection) editMeasureSelection.hidden = true;
+    if (endingStartPreview) endingStartPreview.hidden = true;
     if (musicxmlBlobUrl) URL.revokeObjectURL(musicxmlBlobUrl);
+    if (midiBlobUrl) URL.revokeObjectURL(midiBlobUrl);
     musicxmlBlobUrl = null;
+    midiBlobUrl = null;
     musicxmlDownload.hidden = true;
     musicxmlDownload.removeAttribute("href");
+    midiDownload.hidden = true;
+    midiDownload.removeAttribute("href");
+    if (scoreEditBtn) {
+      scoreEditBtn.hidden = !track.libraryId;
+      scoreEditBtn.setAttribute("aria-expanded", "false");
+    }
+    if (scoreValidateBtn) scoreValidateBtn.hidden = !track.libraryId;
+    if (validationStatus) validationStatus.textContent = "";
+    if (scoreEditor) scoreEditor.hidden = true;
+    if (scoreEditorStatus) scoreEditorStatus.textContent = "";
     notationMessage.hidden = true;
     notationViewport.hidden = true;
     verovioNotation.hidden = true;
@@ -700,35 +799,9 @@
     totalDuration = 0;
     scoreDuration = 0;
     currentNotationPage = 1;
+    notationPageManuallySelected = false;
     currentTrackForLayout = track;
-    if (recognitionReview) {
-      var report = track.recognitionReport;
-      recognitionReview.hidden = !report;
-      recognitionReview.open = false;
-      if (report) {
-        var issues = report.issues || [];
-        var sourceLayout = report.source_layout;
-        var warnings = (report.export_warnings || []).concat(sourceLayout ? (sourceLayout.warnings || []) : []);
-        var numbers = Array.from(new Set(issues.map(function (i) { return i.measure; })));
-        document.getElementById("recognitionSummary").textContent = numbers.length
-          ? "Check measures " + numbers.join(", ") + " — recognition may be incomplete"
-          : (warnings.length ? "Recognition export required recovery — review details" : "Automatic transcription — compare with the original");
-        document.getElementById("recognitionNotice").textContent = report.notice || "Review the automatic transcription against your source file.";
-        if (sourceLayout && sourceLayout.preserved) {
-          document.getElementById("recognitionNotice").textContent += " Source layout preserved: "
-            + sourceLayout.systems.length + " systems; staves per system: "
-            + sourceLayout.systems.map(function (s) { return s.staff_count; }).join(", ")
-            + "; measures per system: " + sourceLayout.systems.map(function (s) { return s.measure_count; }).join(", ") + ".";
-        }
-        var issueList = document.getElementById("recognitionIssues");
-        issueList.replaceChildren();
-        warnings.concat(issues.map(function (i) { return i.message; })).forEach(function (message) {
-          var item = document.createElement("li");
-          item.textContent = message;
-          issueList.appendChild(item);
-        });
-      }
-    }
+    renderRecognitionReview(track, false);
     return verovioReady.then(function () {
       var xmlBytes = null;
       if (track.musicxmlBase64) {
@@ -763,7 +836,19 @@
       if (hasVerovioScore) {
         try { renderedMidi = verovioTk.renderToMIDI(); } catch (err) { /* use backend MIDI */ }
       }
-      var candidates = [renderedMidi, track.midiBase64].filter(Boolean);
+      // The backend expands repeats and volta endings into performed order.
+      // Prefer it over renderer-specific MIDI interpretations.
+      var exportMidi = track.midiBase64 || renderedMidi;
+      if (exportMidi) {
+        try {
+          var exportBytes = Uint8Array.from(atob(exportMidi), function (c) { return c.charCodeAt(0); });
+          midiBlobUrl = URL.createObjectURL(new Blob([exportBytes], { type: "audio/midi" }));
+          midiDownload.href = midiBlobUrl;
+          midiDownload.download = (track.filename || "score") + ".mid";
+          midiDownload.hidden = false;
+        } catch (err) { /* playback error below provides the actionable message */ }
+      }
+      var candidates = [track.midiBase64, renderedMidi].filter(Boolean);
       for (var i = 0; i < candidates.length && !notes.length; i++) {
         try {
           var midiBytes = Uint8Array.from(atob(candidates[i]), function (c) { return c.charCodeAt(0); });
@@ -772,8 +857,10 @@
           totalDuration = midiData.duration;
         } catch (err) { /* try the next MIDI source */ }
       }
-      scoreDuration = hasVerovioScore ? getVerovioScoreDuration() : 0;
-      notationTitle.textContent = "Recognized Sheet Music";
+      scoreDuration = hasVerovioScore
+        ? ((track.playbackTimeMap && track.playbackTimeMap.length) ? totalDuration : getVerovioScoreDuration())
+        : 0;
+      notationTitle.textContent = track.sourceFilename || (track.file && track.file.name) || track.filename || "Score";
       notationSection.hidden = false;
       updatePageNav();
       playBtn.disabled = notes.length === 0;
@@ -847,16 +934,14 @@
     });
   }
 
-  function displayTrackName(filename, engine) {
-    var name = (filename || "score").replace(/\.(pdf|png|jpg|jpeg|musicxml|mxl|xml)$/i, "");
-    if (ENGINE_LABELS[engine]) name += " — " + ENGINE_LABELS[engine];
-    return name;
+  function displayTrackName(filename) {
+    return (filename || "score").replace(/\.(pdf|png|jpg|jpeg|musicxml|mxl|xml)$/i, "");
   }
 
   function applyResultToTrack(track, data) {
     track.libraryId = data.library_id || track.libraryId || null;
     track.engine = data.engine || track.engine || null;
-    track.filename = displayTrackName(data.filename || track.sourceFilename || track.filename, track.engine);
+    track.filename = displayTrackName(data.filename || track.sourceFilename || track.filename);
     track.sourceFilename = data.filename || track.sourceFilename || null;
     track.midiBase64 = data.midi_base64 || "";
     track.playbackError = data.playback_error || null;
@@ -866,11 +951,401 @@
     track.measuresPerFirstSystem = data.measures_per_first_system;
     track.measuresPerLine = data.measures_per_line;
     track.measureBoundaries = data.measure_boundaries || [];
+    track.playbackTimeMap = data.playback_time_map || [];
     track.systemTimeRanges = data.system_time_ranges || [];
     track.systemRegions = data.system_regions || [];
     track.measureLayoutPositions = data.measure_layout_positions || [];
     track.measureNotePositions = data.measure_note_positions || [];
+    track.measureNumbers = data.measure_numbers || track.measureNumbers || [];
     return track;
+  }
+
+  function setScoreEditorPosition(left, top) {
+    if (!scoreEditor) return;
+    var editorRect = scoreEditor.getBoundingClientRect();
+    var viewportWidth = window.innerWidth || 1200;
+    var viewportHeight = window.innerHeight || 800;
+    var editorWidth = Math.min(editorRect.width, viewportWidth - 24);
+    var editorHeight = Math.min(editorRect.height, viewportHeight - 24);
+    left = Math.max(12, Math.min(left, viewportWidth - editorWidth - 12));
+    top = Math.max(12, Math.min(top, viewportHeight - editorHeight - 12));
+    scoreEditor.style.left = left + "px";
+    scoreEditor.style.top = top + "px";
+  }
+
+  function positionScoreEditor(group) {
+    if (!scoreEditor || scoreEditor.hidden) return;
+    if (scoreEditorManuallyPositioned) {
+      var currentRect = scoreEditor.getBoundingClientRect();
+      setScoreEditorPosition(currentRect.left, currentRect.top);
+      return;
+    }
+    var anchor = group || scoreEditBtn;
+    if (!anchor || typeof anchor.getBoundingClientRect !== "function") return;
+    var anchorRect = anchor.getBoundingClientRect();
+    var editorRect = scoreEditor.getBoundingClientRect();
+    var viewportWidth = window.innerWidth || 1200;
+    var viewportHeight = window.innerHeight || 800;
+    var editorWidth = Math.min(editorRect.width, viewportWidth - 24);
+    var left = anchorRect.left + (anchorRect.width - editorWidth) / 2;
+    var anchorGap = group && pendingEndingStart ? 32 : 10;
+    var top = group ? anchorRect.top - editorRect.height - anchorGap : anchorRect.bottom + 10;
+    if (top < 12) top = anchorRect.bottom + 10;
+    if (top + editorRect.height > viewportHeight - 12) {
+      top = Math.max(12, viewportHeight - editorRect.height - 12);
+    }
+    setScoreEditorPosition(left, top);
+  }
+
+  function beginScoreEditorDrag(event) {
+    if (!scoreEditor || scoreEditor.hidden || (event.button != null && event.button !== 0)) return;
+    event.preventDefault();
+    var rect = scoreEditor.getBoundingClientRect();
+    var offsetX = event.clientX - rect.left;
+    var offsetY = event.clientY - rect.top;
+    scoreEditorManuallyPositioned = true;
+    scoreEditor.classList.add("is-dragging");
+
+    function onMove(moveEvent) {
+      if (moveEvent.preventDefault) moveEvent.preventDefault();
+      setScoreEditorPosition(moveEvent.clientX - offsetX, moveEvent.clientY - offsetY);
+    }
+
+    function onUp() {
+      scoreEditor.classList.remove("is-dragging");
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      document.removeEventListener("pointercancel", onUp);
+    }
+
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+    document.addEventListener("pointercancel", onUp);
+  }
+
+  function setScoreEditorOpen(open) {
+    if (!scoreEditor || !scoreEditBtn) return;
+    var track = playlist.find(function (item) { return item.id === currentTrackId; });
+    open = !!open && !!(track && track.libraryId);
+    if (open && scoreEditor.hidden) {
+      scoreEditorManuallyPositioned = false;
+      pendingMusicXmlEdits = [];
+      selectedEditMeasure = null;
+      pendingEndingStart = null;
+      if (editMeasure) editMeasure.value = "";
+      if (scoreEditorSave) scoreEditorSave.disabled = true;
+      if (scoreEditorStatus) scoreEditorStatus.textContent = "Select a measure directly in the notation below.";
+    }
+    scoreEditor.hidden = !open;
+    scoreEditBtn.setAttribute("aria-expanded", open ? "true" : "false");
+    if (!open && editMeasureSelection) editMeasureSelection.hidden = true;
+    if (!open && endingStartPreview) endingStartPreview.hidden = true;
+    if (open) positionScoreEditor(null);
+  }
+
+  function loadNotationPreview(base64, format) {
+    return verovioReady.then(function () {
+      if (!verovioTk || !base64) throw new Error("The notation preview is unavailable.");
+      var bytes = Uint8Array.from(atob(base64), function (c) { return c.charCodeAt(0); });
+      applyVerovioLayout(false);
+      var loaded = format === "mxl"
+        ? verovioTk.loadZipDataBuffer(bytes.buffer)
+        : verovioTk.loadData(new TextDecoder().decode(bytes));
+      if (loaded === false) throw new Error("The staged MusicXML could not be rendered.");
+      applyVerovioLayout();
+      var total = verovioTk.getPageCount ? verovioTk.getPageCount() : 1;
+      currentNotationPage = Math.max(1, Math.min(currentNotationPage, total));
+      verovioNotation.innerHTML = verovioTk.renderToSVG(currentNotationPage);
+      hasVerovioScore = true;
+      notationViewport.hidden = false;
+      verovioNotation.hidden = false;
+      updatePageNav();
+      restoreEditMeasureSelection();
+    });
+  }
+
+  function positionEditMeasureSelection(group, reanchorToolbar) {
+    if (!editMeasureSelection || !group || !notationViewport) return;
+    var groupRect = group.getBoundingClientRect();
+    var viewportRect = notationViewport.getBoundingClientRect();
+    editMeasureSelection.style.left = (groupRect.left - viewportRect.left) + "px";
+    editMeasureSelection.style.top = (groupRect.top - viewportRect.top) + "px";
+    editMeasureSelection.style.width = groupRect.width + "px";
+    editMeasureSelection.style.height = groupRect.height + "px";
+    editMeasureSelection.hidden = false;
+    if (reanchorToolbar) {
+      scoreEditorManuallyPositioned = false;
+      positionScoreEditor(group);
+      scoreEditorManuallyPositioned = true;
+    }
+  }
+
+  function measureNumberForGroup(group) {
+    if (!group) return null;
+    var attributes = {};
+    if (verovioTk && typeof verovioTk.getElementAttr === "function" && group.id) {
+      try {
+        attributes = verovioTk.getElementAttr(group.id) || {};
+        if (typeof attributes === "string") attributes = JSON.parse(attributes);
+      } catch (error) { attributes = {}; }
+    }
+    return attributes.n != null ? String(attributes.n) : (group.dataset ? group.dataset.measureNumber : null);
+  }
+
+  function restorePendingEndingPreview() {
+    if (!endingStartPreview || !pendingEndingStart || scoreEditor.hidden) {
+      if (endingStartPreview) endingStartPreview.hidden = true;
+      return;
+    }
+    var groups = verovioNotation.querySelectorAll("g.measure[id]");
+    for (var i = 0; i < groups.length; i++) {
+      if (measureNumberForGroup(groups[i]) !== pendingEndingStart.measure) continue;
+      var groupRect = groups[i].getBoundingClientRect();
+      var viewportRect = notationViewport.getBoundingClientRect();
+      endingStartPreview.style.left = (groupRect.left - viewportRect.left) + "px";
+      endingStartPreview.style.top = Math.max(1, groupRect.top - viewportRect.top - 20) + "px";
+      endingStartPreview.style.width = groupRect.width + "px";
+      endingStartPreview.dataset.endingLabel = pendingEndingStart.number + ".";
+      endingStartPreview.hidden = false;
+      return;
+    }
+    endingStartPreview.hidden = true;
+  }
+
+  function restoreEditMeasureSelection(reanchorToolbar) {
+    if (!selectedEditMeasure || scoreEditor.hidden) return;
+    var groups = verovioNotation.querySelectorAll("g.measure[id]");
+    for (var i = 0; i < groups.length; i++) {
+      if (measureNumberForGroup(groups[i]) === selectedEditMeasure) {
+        positionEditMeasureSelection(groups[i], !!reanchorToolbar);
+        restorePendingEndingPreview();
+        return;
+      }
+    }
+    if (editMeasureSelection) editMeasureSelection.hidden = true;
+    restorePendingEndingPreview();
+  }
+
+  function selectMeasureForEdit(event) {
+    if (!scoreEditor || scoreEditor.hidden || !event.target || typeof event.target.closest !== "function") return;
+    var group = event.target.closest("g.measure");
+    if (!group) return;
+    var number = measureNumberForGroup(group);
+    if (!number) {
+      if (scoreEditorStatus) scoreEditorStatus.textContent = "That measure could not be identified. Try clicking inside its staff lines.";
+      return;
+    }
+    selectedEditMeasure = number;
+    if (editMeasure) editMeasure.value = number;
+    positionEditMeasureSelection(group, true);
+    if (scoreEditorStatus) scoreEditorStatus.textContent = "Measure " + number + " selected.";
+  }
+
+  function selectEnteredMeasureForEdit() {
+    if (!editMeasure || !scoreEditor || scoreEditor.hidden) return;
+    var number = editMeasure.value.trim();
+    var track = playlist.find(function (item) { return item.id === currentTrackId; });
+    var knownMeasures = track && track.measureNumbers ? track.measureNumbers.map(String) : [];
+    if (!number) {
+      selectedEditMeasure = null;
+      if (editMeasureSelection) editMeasureSelection.hidden = true;
+      if (scoreEditorStatus) scoreEditorStatus.textContent = "Click a measure in the notation or type its number.";
+      return;
+    }
+    if (knownMeasures.length && knownMeasures.indexOf(number) === -1) {
+      selectedEditMeasure = null;
+      if (editMeasureSelection) editMeasureSelection.hidden = true;
+      if (scoreEditorStatus) scoreEditorStatus.textContent = "Measure " + number + " was not found in this score.";
+      return;
+    }
+    selectedEditMeasure = number;
+    restoreEditMeasureSelection(true);
+    if (scoreEditorStatus) scoreEditorStatus.textContent = "Measure " + number + " selected.";
+  }
+
+  function validateCurrentScore() {
+    if (trackLoading) return Promise.resolve(false);
+    var track = playlist.find(function (item) { return item.id === currentTrackId; });
+    if (!track || !track.libraryId) {
+      showError("This score is not stored in the shared server library.");
+      return Promise.resolve(false);
+    }
+    trackLoading = true;
+    scoreValidateBtn.disabled = true;
+    if (validationStatus) validationStatus.textContent = "Validating…";
+    var baseUrl = API_URL || window.location.origin;
+    return fetch(baseUrl + "/library/" + encodeURIComponent(track.libraryId) + "/validate", {
+      method: "POST",
+    }).then(function (response) {
+      return response.text().then(function (body) {
+        var data;
+        try { data = JSON.parse(body); } catch (err) { data = {}; }
+        if (response.ok === false) throw new Error(data.detail || "Semantic validation failed.");
+        return data;
+      });
+    }).then(function (data) {
+      track.recognitionReport = data.recognition_report || null;
+      var issueCount = track.recognitionReport && track.recognitionReport.issues
+        ? track.recognitionReport.issues.length : 0;
+      renderRecognitionReview(track, issueCount > 0);
+      if (validationStatus) validationStatus.textContent = issueCount
+        ? issueCount + (issueCount === 1 ? " issue found" : " issues found")
+        : "No semantic issues found";
+      return true;
+    }).catch(function (error) {
+      if (validationStatus) validationStatus.textContent = error.message || "Semantic validation failed.";
+      return false;
+    }).finally(function () {
+      trackLoading = false;
+      scoreValidateBtn.disabled = false;
+    });
+  }
+
+  function stageMusicXmlEdit(payload) {
+    var repeatMatch = /^(?:add|remove)_(forward|backward)_repeat$/.exec(payload.action);
+    if (!repeatMatch) return pendingMusicXmlEdits.concat([payload]);
+    var repeatKey = String(payload.measure) + ":" + repeatMatch[1];
+    return pendingMusicXmlEdits.filter(function (edit) {
+      var match = /^(?:add|remove)_(forward|backward)_repeat$/.exec(edit.action);
+      return !match || String(edit.measure) + ":" + match[1] !== repeatKey;
+    }).concat([payload]);
+  }
+
+  function updatePendingEndingStart(payload) {
+    if (payload.action === "add_ending_start") {
+      pendingEndingStart = {
+        measure: String(payload.measure),
+        number: String(payload.ending_number || "1"),
+      };
+    } else if ((payload.action === "add_ending_stop" || payload.action === "add_ending_discontinue")
+               && pendingEndingStart
+               && pendingEndingStart.number === String(payload.ending_number || "1")) {
+      pendingEndingStart = null;
+    } else if (payload.action === "remove_endings" && pendingEndingStart
+               && pendingEndingStart.measure === String(payload.measure)) {
+      pendingEndingStart = null;
+    }
+  }
+
+  function applyMusicXmlEdit(action) {
+    if (trackLoading) return Promise.resolve(false);
+    var track = playlist.find(function (item) { return item.id === currentTrackId; });
+    if (!track || !track.libraryId) {
+      showError("This score is not stored in the shared server library.");
+      return Promise.resolve(false);
+    }
+    if (!selectedEditMeasure) {
+      if (scoreEditorStatus) scoreEditorStatus.textContent = "Click a measure in the notation first.";
+      return Promise.resolve(false);
+    }
+    var payload = { measure: selectedEditMeasure, action: action };
+    if (action.indexOf("ending") !== -1 && action !== "remove_endings") {
+      payload.ending_number = editEndingNumber ? editEndingNumber.value : "1";
+    }
+    var buttons = Array.from(document.querySelectorAll("[data-edit-action]"));
+    buttons.forEach(function (button) { button.disabled = true; });
+    trackLoading = true;
+    var stagedEdits = stageMusicXmlEdit(payload);
+    if (scoreEditorStatus) scoreEditorStatus.textContent = "Updating preview…";
+    var baseUrl = API_URL || window.location.origin;
+    return fetch(baseUrl + "/library/" + encodeURIComponent(track.libraryId) + "/edit-preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ edits: stagedEdits }),
+    }).then(function (response) {
+      return response.text().then(function (body) {
+        var data;
+        try { data = JSON.parse(body); } catch (err) { data = {}; }
+        if (response.ok === false) throw new Error(data.detail || "The correction could not be previewed.");
+        return data;
+      });
+    }).then(function (data) {
+      return loadNotationPreview(data.musicxml_base64, data.musicxml_format).then(function () {
+        pendingMusicXmlEdits = stagedEdits;
+        updatePendingEndingStart(payload);
+        restoreEditMeasureSelection();
+        restorePendingEndingPreview();
+        playBtn.disabled = true;
+        if (scoreEditorSave) scoreEditorSave.disabled = !!pendingEndingStart;
+        if (scoreEditorStatus) {
+          if (pendingEndingStart) {
+            scoreEditorStatus.textContent = "Ending " + pendingEndingStart.number + " starts at measure "
+              + pendingEndingStart.measure + ". Select its last measure and close the bracket.";
+          } else {
+            scoreEditorStatus.textContent = data.edit_changed
+              ? "Preview updated. Save to update playback."
+              : "The preview is unchanged; this marker may already be present.";
+          }
+        }
+        return true;
+      });
+    }).catch(function (error) {
+      if (scoreEditorStatus) scoreEditorStatus.textContent = error.message || "The correction could not be saved.";
+      return false;
+    }).finally(function () {
+      trackLoading = false;
+      buttons.forEach(function (button) { button.disabled = false; });
+    });
+  }
+
+  function discardMusicXmlEdits() {
+    var track = playlist.find(function (item) { return item.id === currentTrackId; });
+    pendingMusicXmlEdits = [];
+    selectedEditMeasure = null;
+    pendingEndingStart = null;
+    if (endingStartPreview) endingStartPreview.hidden = true;
+    if (scoreEditorSave) scoreEditorSave.disabled = true;
+    if (!track || !track.musicxmlBase64) {
+      setScoreEditorOpen(false);
+      return Promise.resolve(false);
+    }
+    return loadNotationPreview(track.musicxmlBase64, track.musicxmlFormat).then(function () {
+      playBtn.disabled = notes.length === 0;
+      setScoreEditorOpen(false);
+      return true;
+    });
+  }
+
+  function saveMusicXmlEdits() {
+    if (trackLoading || !pendingMusicXmlEdits.length) return Promise.resolve(false);
+    if (pendingEndingStart) {
+      if (scoreEditorStatus) scoreEditorStatus.textContent = "Close the pending ending bracket before saving.";
+      return Promise.resolve(false);
+    }
+    var track = playlist.find(function (item) { return item.id === currentTrackId; });
+    if (!track || !track.libraryId) return Promise.resolve(false);
+    trackLoading = true;
+    scoreEditorSave.disabled = true;
+    if (scoreEditorStatus) scoreEditorStatus.textContent = "Saving changes…";
+    var baseUrl = API_URL || window.location.origin;
+    return fetch(baseUrl + "/library/" + encodeURIComponent(track.libraryId) + "/edit-batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ edits: pendingMusicXmlEdits }),
+    }).then(function (response) {
+      return response.text().then(function (body) {
+        var data;
+        try { data = JSON.parse(body); } catch (error) { data = {}; }
+        if (response.ok === false) throw new Error(data.detail || "The changes could not be saved.");
+        return data;
+      });
+    }).then(function (data) {
+      pendingMusicXmlEdits = [];
+      selectedEditMeasure = null;
+      pendingEndingStart = null;
+      if (endingStartPreview) endingStartPreview.hidden = true;
+      applyResultToTrack(track, data);
+      return setupTrackFromStoredData(track).then(function () {
+        if (validationStatus) validationStatus.textContent = "Changes saved";
+        return true;
+      });
+    }).catch(function (error) {
+      scoreEditorSave.disabled = false;
+      if (scoreEditorStatus) scoreEditorStatus.textContent = error.message || "The changes could not be saved.";
+      return false;
+    }).finally(function () {
+      trackLoading = false;
+    });
   }
 
   function addToPlaylist(data, file) {
@@ -884,7 +1359,7 @@
       return existing;
     }
     var id = data.library_id ? "library-" + data.library_id : "track-" + (++playlistIdCounter);
-    var filename = displayTrackName(data.filename || file.name, data.engine);
+    var filename = displayTrackName(data.filename || file.name);
     var track = {
       id: id,
       filename: filename,
@@ -899,10 +1374,12 @@
       measuresPerFirstSystem: data.measures_per_first_system,
       measuresPerLine: data.measures_per_line,
       measureBoundaries: data.measure_boundaries || [],
+      playbackTimeMap: data.playback_time_map || [],
       systemTimeRanges: data.system_time_ranges || [],
       systemRegions: data.system_regions || [],
       measureLayoutPositions: data.measure_layout_positions || [],
       measureNotePositions: data.measure_note_positions || [],
+      measureNumbers: data.measure_numbers || [],
       file: file,
     };
     playlist.push(track);
@@ -939,7 +1416,6 @@
       return setupTrackFromStoredData(track);
     }).then(function () {
       hideStatus();
-      trackNameEl.textContent = track.filename;
       progressBar.style.width = "0%";
       var endTime = scoreDuration > 0 ? scoreDuration : totalDuration;
       progressText.textContent = "0:00 / " + formatTime(endTime);
@@ -978,9 +1454,13 @@
         playerSection.hidden = true;
         if (mainPlaceholder) mainPlaceholder.hidden = false;
         if (musicxmlBlobUrl) URL.revokeObjectURL(musicxmlBlobUrl);
+        if (midiBlobUrl) URL.revokeObjectURL(midiBlobUrl);
         musicxmlBlobUrl = null;
+        midiBlobUrl = null;
         musicxmlDownload.hidden = true;
         musicxmlDownload.removeAttribute("href");
+        midiDownload.hidden = true;
+        midiDownload.removeAttribute("href");
         midiData = null;
         notes = [];
         totalDuration = 0;
@@ -1107,11 +1587,35 @@
 
   if (prevPageBtn) prevPageBtn.addEventListener("click", function () { goToPage(currentNotationPage - 1); });
   if (nextPageBtn) nextPageBtn.addEventListener("click", function () { goToPage(currentNotationPage + 1); });
+  if (scoreValidateBtn) scoreValidateBtn.addEventListener("click", validateCurrentScore);
+  if (scoreEditBtn) scoreEditBtn.addEventListener("click", function () {
+    if (scoreEditor.hidden) setScoreEditorOpen(true);
+    else if (!pendingMusicXmlEdits.length || window.confirm("Discard the unsaved score corrections?")) discardMusicXmlEdits();
+  });
+  if (scoreEditorClose) scoreEditorClose.addEventListener("click", function () {
+    if (!pendingMusicXmlEdits.length || window.confirm("Discard the unsaved score corrections?")) discardMusicXmlEdits();
+  });
+  if (scoreEditorCancel) scoreEditorCancel.addEventListener("click", function () {
+    if (!pendingMusicXmlEdits.length || window.confirm("Discard the unsaved score corrections?")) discardMusicXmlEdits();
+  });
+  if (scoreEditorSave) scoreEditorSave.addEventListener("click", saveMusicXmlEdits);
+  if (scoreEditorDragHandle) scoreEditorDragHandle.addEventListener("pointerdown", beginScoreEditorDrag);
+  if (editMeasure) editMeasure.addEventListener("input", selectEnteredMeasureForEdit);
+  if (verovioNotation) verovioNotation.addEventListener("click", selectMeasureForEdit);
+  Array.from(document.querySelectorAll("[data-edit-action]")).forEach(function (button) {
+    button.addEventListener("click", function () { applyMusicXmlEdit(button.dataset.editAction); });
+  });
 
   // SVG note coordinates change when the responsive score is resized. Keep
   // the paused marker aligned too, without reactivating it after Stop.
   window.addEventListener("resize", function () {
     if (playbackHighlightVisible) updateNotationView(false);
+    if (selectedEditMeasure) restoreEditMeasureSelection();
+    else if (scoreEditor && !scoreEditor.hidden) positionScoreEditor(null);
+  });
+  window.addEventListener("scroll", function () {
+    if (selectedEditMeasure) restoreEditMeasureSelection();
+    else if (scoreEditor && !scoreEditor.hidden) positionScoreEditor(null);
   });
 
   // Check backend on load (read body once to avoid "stream already read" error)

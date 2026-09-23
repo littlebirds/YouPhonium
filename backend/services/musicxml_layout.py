@@ -177,6 +177,70 @@ def get_measure_boundaries(musicxml_path: Path, bpm: float = 120.0) -> List[Tupl
         return []
 
 
+def get_playback_time_map(musicxml_path: Path) -> List[Dict[str, float]]:
+    """Map expanded playback seconds back onto the written score timeline.
+
+    MIDI contains repeated measures as ordinary sequential events, while the
+    displayed MusicXML retains repeat and volta marks.  Each returned segment
+    identifies where a performed measure lives in the written score so clients
+    can visibly jump back at repeats.
+    """
+    path = Path(musicxml_path)
+    if not path.exists():
+        return []
+
+    try:
+        from music21 import converter, stream
+
+        score = converter.parse(str(path))
+        if not score.parts:
+            return []
+        written_part = score.parts[0]
+        written_measures = list(written_part.getElementsByClass(stream.Measure))
+        if not written_measures:
+            return []
+
+        # Editorial metadata survives music21's repeat-expansion deep copies,
+        # avoiding ambiguity when recognized scores contain duplicate labels.
+        for index, measure in enumerate(written_measures):
+            measure.editorial.playbackSourceIndex = index
+        try:
+            playback_score = score.expandRepeats()
+        except Exception:
+            playback_score = score
+        playback_part = playback_score.parts[0]
+        playback_measures = list(playback_part.getElementsByClass(stream.Measure))
+
+        def timings(part):
+            return {
+                id(item["element"]): item
+                for item in part.secondsMap
+                if isinstance(item["element"], stream.Measure)
+            }
+
+        written_times = timings(written_part)
+        playback_times = timings(playback_part)
+        result = []
+        for playback_measure in playback_measures:
+            source_index = getattr(playback_measure.editorial, "playbackSourceIndex", None)
+            if source_index is None or not 0 <= source_index < len(written_measures):
+                continue
+            source = written_times.get(id(written_measures[source_index]))
+            performed = playback_times.get(id(playback_measure))
+            if not source or not performed:
+                continue
+            result.append({
+                "playback_start": float(performed["offsetSeconds"]),
+                "playback_end": float(performed["endTimeSeconds"]),
+                "score_start": float(source["offsetSeconds"]),
+                "score_end": float(source["endTimeSeconds"]),
+                "measure_index": source_index,
+            })
+        return result
+    except Exception:
+        return []
+
+
 def get_measure_layout_positions(musicxml_path: Path) -> List[Dict[str, Any]]:
     """
     Return layout positions for each measure using music21 divideByPages.

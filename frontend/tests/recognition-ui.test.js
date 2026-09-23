@@ -29,13 +29,16 @@ function element() {
 }
 const scoreNodes = new Map();
 const windowEvents = {};
+const documentEvents = {};
 let elementsAtTime = () => ({ page: 1, notes: [] });
 const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
 const ids = new Set([...html.matchAll(/id="([^"]+)"/g)].map(match => match[1]));
-for (const removed of ['engineSelector', 'engineAudiveris', 'engineHomr', 'viewToggle', 'sourceImage', 'pdfContainer', 'comparisonSection']) {
-  assert.ok(!ids.has(removed), removed + ' is removed from the page');
+for (const removed of ['engineSelector', 'engineAudiveris', 'engineHomr', 'viewToggle', 'sourceImage', 'pdfContainer', 'comparisonSection', 'trackName', 'recognitionEngine']) {
+assert.ok(!ids.has(removed), removed + ' is removed from the page');
 }
 assert.doesNotMatch(html, /comparison\.js|pdf\.min\.js/);
+assert.doesNotMatch(html, /score-editor-heading|score-editor-help|<span>Selected measure<\/span>/);
+assert.match(html, /data-tooltip="Click a measure in the score or type its number/);
 const elements = new Map();
 const get = id => {
   if (!ids.has(id)) return null;
@@ -49,6 +52,7 @@ let rendererFails = false;
 let midiFails = false;
 let pageCount = 2;
 const operations = [];
+const midiInputs = [];
 let now = 0;
 const sounds = { stops: 0, played: [], stop() { this.stops++; }, play(...args) { this.played.push(args); } };
 class Toolkit {
@@ -56,14 +60,17 @@ class Toolkit {
   loadData() { operations.push('load'); return !rendererFails; }
   loadZipDataBuffer() { operations.push('load'); }
   redoLayout() {}
-  renderToMIDI() { return midiFails ? null : 'AA=='; }
+  renderToMIDI() { return midiFails ? null : 'AQ=='; }
   renderToSVG() { return '<svg><g class="note"/></svg>'; }
   getPageCount() { return pageCount; }
   getElementsAtTime(ms) { return elementsAtTime(ms); }
   getTimeForElement(id) { return scoreNodes.get(id)?.onset || 0; }
+  getElementAttr(id) { return id === 'measure-71' ? { n: '71' } : {}; }
 }
 const context = {
-  document: { getElementById: get, createElement: element, addEventListener() {},
+  document: { getElementById: get, createElement: element,
+    addEventListener(name, callback) { documentEvents[name] = callback; },
+    removeEventListener(name, callback) { if (documentEvents[name] === callback) delete documentEvents[name]; },
     querySelectorAll() { return []; } },
   window: { location: { protocol: 'http:', origin: 'http://test.invalid' }, innerHeight: 700,
             addEventListener(name, callback) { windowEvents[name] = callback; },
@@ -73,7 +80,7 @@ const context = {
   verovio: { module: {}, toolkit: Toolkit },
   fetch: async () => ({ text: async () => '{"omr_homr":true}' }),
   URL: { createObjectURL: blob => { blobs.push(blob); return 'blob:test-' + blobs.length; }, revokeObjectURL(url) { revoked.push(url); } },
-  Midi: class { constructor() { this.duration = 4; this.tracks = [{ notes: [{ midi: 60, time: 0, duration: 4, velocity: 0.8 }] }]; } },
+  Midi: class { constructor(buffer) { midiInputs.push(new Uint8Array(buffer)[0]); this.duration = 4; this.tracks = [{ notes: [{ midi: 60, time: 0, duration: 4, velocity: 0.8 }] }]; } },
   CSS: { escape: value => value }, TextDecoder, Uint8Array, Blob, FormData: class {
     constructor() { this.values = {}; }
     append(key, value) { this.values[key] = value; }
@@ -84,7 +91,9 @@ const context = {
 let script = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
 // Expose only in the test VM, leaving the production closure unchanged.
 script = script.replace(/\}\)\(\);\s*$/, `globalThis.testApi = { setupTrackFromStoredData, handleFile, loadTrack, deleteTrack, loadServerLibrary, goToPage,
-  play, pause, stop, seekTo, onTempoChange, tick, resetInstrument: () => { instrument = null; },
+  play, pause, stop, seekTo, onTempoChange, tick, setScoreEditorOpen, applyMusicXmlEdit, validateCurrentScore,
+  selectMeasureForEdit, saveMusicXmlEdits, discardMusicXmlEdits, notationTimeForPlayback,
+  resetInstrument: () => { instrument = null; },
   getPlaybackState: () => ({ isPlaying, playhead, tempo, trackLoading, currentTrackId, playlist }) }; })();`);
 vm.runInNewContext(script, context);
 context.verovio.module.onRuntimeInitialized();
@@ -97,7 +106,7 @@ context.verovio.module.onRuntimeInitialized();
   get('browseBtn').events.click({ stopPropagation() {} });
   assert.equal(pickerOpened, 2);
   const track = {
-    engine: 'homr', filename: 'score — HOMR', file: { name: 'score.png' },
+    engine: 'homr', filename: 'score', file: { name: 'score.png' },
     midiBase64: 'AA==', musicxmlBase64: 'PHNjb3JlLz4=', musicxmlFormat: 'xml',
     systemRegions: [[1, 4], [5, 8]],
     recognitionReport: { has_encoded_breaks: true, notice: 'Review the transcription',
@@ -106,7 +115,10 @@ context.verovio.module.onRuntimeInitialized();
         systems: [{ staff_count: 2, measure_count: 4 }, { staff_count: 2, measure_count: 3 }] } },
   };
   await context.testApi.setupTrackFromStoredData(track);
-  assert.equal(get('recognitionEngine').textContent, 'Recognized by HOMR');
+  assert.equal(midiInputs.at(-1), 0, 'Backend MIDI is preferred because it expands repeat playback');
+  const exportedMidiBytes = new Uint8Array(await blobs.at(-1).arrayBuffer());
+  assert.equal(blobs.at(-1).type, 'audio/midi');
+  assert.equal(exportedMidiBytes[0], 0, 'MIDI download uses the repeat-expanded backend payload');
   assert.equal(get('engineAvailability').textContent, 'Recognition: HOMR · ready');
   assert.equal(options.at(-1).breaks, 'encoded');
   assert.equal(options.at(-1).condense, 'none');
@@ -117,8 +129,11 @@ context.verovio.module.onRuntimeInitialized();
   assert.equal(get('notationViewport').hidden, false);
   assert.equal(get('verovioNotation').hidden, false);
   assert.equal(get('musicxmlDownload').hidden, false);
-  assert.equal(get('musicxmlDownload').download, 'score — HOMR.musicxml');
-  assert.ok(blobs.every(blob => blob instanceof Blob), 'Only result XML gets a blob URL, never the original file');
+  assert.equal(get('musicxmlDownload').download, 'score.musicxml');
+  assert.equal(get('midiDownload').hidden, false);
+  assert.equal(get('midiDownload').download, 'score.mid');
+  assert.equal(get('notationTitle').textContent, 'score.png');
+  assert.ok(blobs.every(blob => blob instanceof Blob), 'Only generated download data gets blob URLs, never the original file');
   assert.equal(get('pageNavSection').hidden, false);
   context.testApi.goToPage(2);
   assert.equal(get('pageNavText').textContent, 'Page 2 of 2');
@@ -163,15 +178,13 @@ context.verovio.module.onRuntimeInitialized();
     await context.testApi.handleFile({ name });
     assert.equal(submittedEngines.at(-1), 'homr', 'Every upload explicitly selects HOMR');
     assert.equal(get('playerSection').hidden, false);
-    assert.equal(get('recognitionEngine').textContent, 'Recognized by HOMR');
-    assert.equal(get('trackName').textContent, name.replace(/\.(png|pdf)$/, '') + ' — HOMR');
+    assert.equal(get('notationTitle').textContent, name);
     assert.equal(state().currentTrackId, state().playlist.at(-1).id, 'New upload displays its own result');
     assert.equal(get('fileInput').disabled, false);
   }
   assert.equal(state().playlist.length, 2);
   await context.testApi.loadTrack(state().playlist[0].id);
-  assert.equal(get('trackName').textContent, 'first — HOMR');
-  assert.equal(get('recognitionEngine').textContent, 'Recognized by HOMR');
+  assert.equal(get('notationTitle').textContent, 'first.png');
   context.testApi.play();
   now = 1000;
   context.testApi.tick();
@@ -204,6 +217,99 @@ context.verovio.module.onRuntimeInitialized();
   context.Soundfont.instrument = async () => sounds;
   await context.testApi.loadTrack(state().playlist[0].id);
   assert.equal(get('playBtn').disabled, false);
+
+  // A server-backed score exposes the focused correction strip and persists
+  // a repeat edit before refreshing notation and semantic warnings.
+  state().playlist[0].libraryId = 'shared-score';
+  state().playlist[0].measureNumbers = ['71', '102'];
+  await context.testApi.setupTrackFromStoredData(state().playlist[0]);
+  assert.equal(get('scoreEditBtn').hidden, false);
+  context.testApi.setScoreEditorOpen(true);
+  assert.equal(get('scoreEditor').hidden, false);
+  get('scoreEditor').rect = { left: 100, top: 100, width: 600, height: 45, bottom: 145 };
+  get('scoreEditorDragHandle').events.pointerdown({ button: 0, clientX: 110, clientY: 110, preventDefault() {} });
+  documentEvents.pointermove({ clientX: 310, clientY: 260, preventDefault() {} });
+  documentEvents.pointerup({});
+  assert.equal(get('scoreEditor').style.left, '300px', 'The correction toolbar can be dragged horizontally');
+  assert.equal(get('scoreEditor').style.top, '250px', 'The correction toolbar can be dragged away from covered measures');
+  get('scoreEditor').rect = { left: 300, top: 250, width: 600, height: 45, bottom: 295 };
+  const selectedMeasure = element();
+  selectedMeasure.id = 'measure-71';
+  selectedMeasure.closest = () => selectedMeasure;
+  context.testApi.selectMeasureForEdit({ target: selectedMeasure });
+  assert.equal(get('editMeasure').value, '71');
+  assert.equal(get('scoreEditor').style.left, '200px', 'Selecting a measure reanchors the correction toolbar once');
+  assert.equal(get('scoreEditor').style.top, '145px');
+  windowEvents.scroll();
+  assert.equal(get('scoreEditor').style.left, '200px', 'Scrolling does not override the anchored or dragged position');
+  let editRequest;
+  context.fetch = async (url, request) => {
+    editRequest = { url, request };
+    return { ok: true, text: async () => JSON.stringify({
+      success: true, musicxml_base64: 'PHNjb3JlLz4=', musicxml_format: 'xml', edit_changed: 1,
+    }) };
+  };
+  assert.equal(await context.testApi.applyMusicXmlEdit('add_forward_repeat'), true);
+  assert.match(editRequest.url, /\/library\/shared-score\/edit-preview$/);
+  assert.deepEqual(JSON.parse(editRequest.request.body), { edits: [{ measure: '71', action: 'add_forward_repeat' }] });
+  assert.match(get('scoreEditorStatus').textContent, /Preview updated/);
+  assert.equal(get('scoreEditorSave').disabled, false);
+  assert.equal(get('scoreEditor').hidden, false);
+  assert.equal(await context.testApi.applyMusicXmlEdit('remove_forward_repeat'), true);
+  assert.deepEqual(JSON.parse(editRequest.request.body), {
+    edits: [{ measure: '71', action: 'remove_forward_repeat' }],
+  }, 'The remove replaces the staged add for the same repeat marker');
+  assert.equal(await context.testApi.applyMusicXmlEdit('add_forward_repeat'), true);
+  assert.deepEqual(JSON.parse(editRequest.request.body), {
+    edits: [{ measure: '71', action: 'add_forward_repeat' }],
+  }, 'The forward repeat can be added again without replaying its inverse edits');
+  get('editMeasure').value = '102';
+  get('editMeasure').events.input();
+  assert.equal(get('scoreEditorStatus').textContent, 'Measure 102 selected.');
+  get('editEndingNumber').value = '1';
+  assert.equal(await context.testApi.applyMusicXmlEdit('add_ending_start'), true);
+  assert.deepEqual(JSON.parse(editRequest.request.body), { edits: [
+    { measure: '71', action: 'add_forward_repeat' },
+    { measure: '102', action: 'add_ending_start', ending_number: '1' },
+  ] });
+  assert.match(get('scoreEditorStatus').textContent, /Select its last measure and close the bracket/);
+  assert.equal(get('scoreEditorSave').disabled, true, 'An incomplete ending cannot be saved');
+  assert.equal(await context.testApi.applyMusicXmlEdit('add_ending_stop'), true);
+  assert.deepEqual(JSON.parse(editRequest.request.body), { edits: [
+    { measure: '71', action: 'add_forward_repeat' },
+    { measure: '102', action: 'add_ending_start', ending_number: '1' },
+    { measure: '102', action: 'add_ending_stop', ending_number: '1' },
+  ] });
+  assert.equal(get('scoreEditorSave').disabled, false);
+  context.fetch = async (url, request) => {
+    editRequest = { url, request };
+    return { ok: true, text: async () => JSON.stringify({
+      success: true, library_id: 'shared-score', filename: 'first.png', engine: 'homr',
+      musicxml_base64: 'PHNjb3JlLz4=', musicxml_format: 'xml', midi_base64: 'AA==',
+      recognition_report: { issues: [], issue_counts: {} }, edit_changed: 1,
+    }) };
+  };
+  assert.equal(await context.testApi.saveMusicXmlEdits(), true);
+  assert.match(editRequest.url, /\/library\/shared-score\/edit-batch$/);
+  assert.deepEqual(JSON.parse(editRequest.request.body), { edits: [
+    { measure: '71', action: 'add_forward_repeat' },
+    { measure: '102', action: 'add_ending_start', ending_number: '1' },
+    { measure: '102', action: 'add_ending_stop', ending_number: '1' },
+  ] });
+  assert.equal(get('validationStatus').textContent, 'Changes saved');
+  context.fetch = async (url, request) => {
+    editRequest = { url, request };
+    return { ok: true, text: async () => JSON.stringify({
+      success: true,
+      recognition_report: { issues: [{ code: 'repeat_unmatched_backward', measure: '102', message: 'Missing forward repeat' }] },
+    }) };
+  };
+  assert.equal(await context.testApi.validateCurrentScore(), true);
+  assert.match(editRequest.url, /\/library\/shared-score\/validate$/);
+  assert.equal(editRequest.request.method, 'POST');
+  assert.equal(get('validationStatus').textContent, '1 issue found');
+  assert.equal(get('recognitionReview').open, true);
+  assert.equal(get('recognitionIssues').children[0].textContent, 'Missing forward repeat');
 
   let rejectUpload;
   context.fetch = (url, request) => {
@@ -251,6 +357,14 @@ context.verovio.module.onRuntimeInitialized();
     : ms < 2000 ? { page: 1, notes: [] }
     : { page: 2, notes: ['later'] };
   state().playlist[0].measureBoundaries = [[0, 2], [2, 4]];
+  state().playlist[0].playbackTimeMap = [
+    { playback_start: 0, playback_end: 2, score_start: 0, score_end: 2 },
+    { playback_start: 2, playback_end: 4, score_start: 2, score_end: 4 },
+    { playback_start: 4, playback_end: 6, score_start: 0, score_end: 2 },
+    { playback_start: 6, playback_end: 8, score_start: 4, score_end: 6 },
+  ];
+  assert.equal(context.testApi.notationTimeForPlayback(4.25), 0.25,
+    'Cursor time jumps back to the written repeat start on the second pass');
   context.testApi.seekTo(0);
   assert.equal(held.classList.contains('playing'), true);
   assert.equal(first['data-playing'], '1');
@@ -260,14 +374,25 @@ context.verovio.module.onRuntimeInitialized();
   assert.equal(get('playbackCursor').style.left, '65px');
   context.testApi.play();
   assert.equal(scrolls, 1, 'Follow an offscreen system when playback starts');
+  pageCount = 2;
+  const playheadBeforePageChange = state().playhead;
+  context.testApi.goToPage(2);
+  assert.equal(state().isPlaying, true, 'Changing notation pages does not pause playback');
+  assert.equal(state().playhead, playheadBeforePageChange, 'Changing notation pages does not seek playback');
+  assert.equal(get('pageNavText').textContent, 'Page 2 of 2');
   now += 1100;
   context.testApi.tick();
+  assert.equal(get('pageNavText').textContent, 'Page 2 of 2', 'Manual page remains visible while playback continues elsewhere');
   assert.equal(first.classList.contains('playing'), false);
   assert.equal(first['data-playing'], undefined);
+  assert.equal(held.classList.contains('playing'), false, 'Cursor notes remain hidden when playback is on another page');
+  assert.equal(get('playbackCursor').hidden, true);
+  assert.equal(scrolls, 1, 'Browsing another page cannot trigger playback auto-scroll');
+  context.testApi.seekTo(1.1);
+  assert.equal(get('pageNavText').textContent, 'Page 1 of 2', 'Seeking resumes automatic cursor page following');
   assert.equal(held.classList.contains('playing'), true);
   assert.equal(next.classList.contains('playing'), true);
   assert.equal(get('playbackCursor').style.left, '145px', 'Cursor follows the latest onset, not the held note');
-  assert.equal(scrolls, 1, 'Do not scroll on every note/frame');
   context.testApi.pause();
   assert.equal(next.classList.contains('playing'), true, 'Pause retains the current position');
   get('notationViewport').rect = { left: 120, top: 200, width: 600, height: 1000 };
@@ -275,7 +400,8 @@ context.verovio.module.onRuntimeInitialized();
   assert.equal(get('playbackCursor').style.left, '125px', 'Paused overlays adapt to resized notation');
   context.testApi.seekTo(1.7);
   assert.equal(held.classList.contains('playing'), false, 'No notes remain active in a rest');
-  assert.equal(get('playbackCursor').hidden, true);
+  assert.equal(get('playbackCursor').hidden, false, 'Cursor continues across rests in the current measure');
+  assert.equal(get('playbackCursor').style.left, '242.5px');
   assert.equal(get('measureHighlight').style.display, 'block', 'The current bar stays indicated during a rest');
   context.testApi.seekTo(2.1);
   assert.equal(later.classList.contains('playing'), true);
@@ -327,7 +453,7 @@ context.verovio.module.onRuntimeInitialized();
   });
   await context.testApi.loadServerLibrary();
   assert.equal(state().playlist.length, 1);
-  assert.equal(state().playlist[0].filename, 'Shared Ballad — HOMR');
+  assert.equal(state().playlist[0].filename, 'Shared Ballad');
   assert.equal(state().playlist[0].musicxmlBase64, null, 'Library listing remains lightweight');
   await context.testApi.loadTrack(state().playlist[0].id);
   assert.equal(state().playlist[0].musicxmlBase64, 'PHNjb3JlLz4=', 'Selecting fetches the stored score');

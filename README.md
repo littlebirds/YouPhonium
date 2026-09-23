@@ -159,6 +159,42 @@ MIDI conversion preserves tuplets and
 dotted rhythms instead of rounding them or guessing corrections. Review the
 result before relying on playback or practice scoring.
 
+### Repeat and volta design notes
+
+Repeat and volta support must not assume that every repeated section plays only
+twice or that every ending applies to exactly one pass. Use one shared data model
+for manual correction, validation, playback, and future geometry-based
+recognition. Represent a volta as a measure span plus a set of passes, for
+example `{startMeasure: 12, endMeasure: 13, passes: [1, 2]}`. A bracket spanning
+several measures needs a start marker only on its first measure and a stop (or
+discontinue) marker only on its last measure.
+
+Keep the correction UI compact: offer individual pass toggles such as **1st**,
+**2nd**, and **3rd**, together with shared **Start bracket** and **Close bracket**
+actions. Do not add a separate control for every pass combination. Serialize the
+selected pass set as a single MusicXML ending number: passes 1 and 2 become
+`<ending number="1,2" type="start" />`, rather than two overlapping ending elements.
+Backward repeats must also preserve explicit counts such as
+`<repeat direction="backward" times="3" />`. The editor may infer the repeat count
+from the highest ending pass for a simple repeat, but it should display the
+inference and allow correction rather than changing playback silently.
+
+Geometry-based repeat/volta recognition must:
+
+- locate bracket starts and ends across one or more measures;
+- recognize labels such as `1.`, `2.`, `3.`, `1, 2.`, and ranges such as `1–2`;
+- normalize combined labels into a pass set and emit one combined MusicXML
+  ending number;
+- recognize repeat-count instructions such as `3×` and “play 3 times”;
+- support more than two passes and validate bracket pass sets against repeat
+  counts; and
+- avoid interpreting a single combined ending as multiple overlapping brackets.
+
+Do not automatically merge independently entered endings merely because they
+start on the same measure: their closing measures may differ. The UI should
+collect the intended pass set when the bracket is created, so the span remains
+unambiguous.
+
 Audiveris 5.11 may omit a whole measure when a hairpin has an untimed endpoint.
 For that specific exporter exception, the pipeline retries a copy of the project
 without the affected hairpin. Any removed expression mark is disclosed in the
