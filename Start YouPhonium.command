@@ -9,7 +9,7 @@ if [ -n "${YOUPHONIUM_PYTHON:-}" ]; then
 else
     python_candidates=(
         "$launcher_dir/backend/venv/bin/python"
-        python3.13 python3.12 python3.11 python3
+        python3.14 python3.13 python3.12 python3.11 python3
         /opt/homebrew/bin/python3 /usr/local/bin/python3
         /Library/Frameworks/Python.framework/Versions/Current/bin/python3
         /Library/Frameworks/Python.framework/Versions/3.*/bin/python3
@@ -24,17 +24,13 @@ for candidate in "${python_candidates[@]}"; do
     # Python distribution we need. Never modify or depend on it.
     [ "$python_path" = /usr/bin/python3 ] && continue
     [ -x "$python_path" ] || continue
-    if "$python_path" -c 'import sys; assert sys.version_info >= (3, 11); import tkinter, venv, ensurepip' >/dev/null 2>&1; then
-        # launch.py prompts before setup, creates backend/venv if missing,
-        # installs requirements there, initializes HOMR, and opens the browser.
+    if "$python_path" -c 'import sys; assert sys.version_info >= (3, 11); import venv, ensurepip' >/dev/null 2>&1; then
+        # launch.py creates backend/venv if missing, installs requirements there,
+        # initializes HOMR, opens the browser, and stays attached to Terminal.
         exec "$python_path" "$launcher_dir/launch.py"
     fi
 done
 
-message='YouPhonium needs Python 3.11 or newer with Tkinter and venv support. Install Python from https://www.python.org/downloads/macos/, run its Install Certificates.command, then double-click Start YouPhonium.command again. Python 3.13 is the version tested with this project.'
+message='YouPhonium needs Python 3.11 or newer with venv support. Install Python from https://www.python.org/downloads/macos/, run its Install Certificates.command, then double-click Start YouPhonium.command again. Python 3.13 is the version tested with this project.'
 printf '%s\n' "$message" >&2
-if command -v osascript >/dev/null 2>&1; then
-    # Static AppleScript: no paths or environment values are interpolated.
-    osascript -e 'display alert "YouPhonium needs Python" message "Install Python 3.11 or newer from python.org/downloads/macos/ (3.13 is tested with this project). The standard installer includes Tkinter and venv. Run its Install Certificates.command, then open Start YouPhonium.command again." as critical' || true
-fi
 exit 1

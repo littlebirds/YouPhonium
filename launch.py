@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import plistlib
-import queue
 import shlex
 import signal
 import socket
@@ -23,7 +22,8 @@ import webbrowser
 
 
 ROOT = Path(__file__).resolve().parent
-HOST = "127.0.0.1"
+LOCAL_HOST = "127.0.0.1"
+BIND_HOST = "0.0.0.0"
 PORTS = range(8000, 8010)
 PROBE = """import importlib.util, importlib.metadata, sys
 names = ('fastapi', 'uvicorn', 'music21', 'multipart', 'fitz', 'PIL', 'numpy', 'homr')
@@ -42,6 +42,13 @@ class Cancelled(Exception):
 
 def project_id(root: Path) -> str:
     return hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
+
+
+def versioned_app_url(url: str, root: Path = ROOT) -> str:
+    """Force a fresh app document when a launcher reuses an existing tab."""
+    script = root / "frontend/app.js"
+    version = script.stat().st_mtime_ns if script.exists() else int(time.time_ns())
+    return f"{url.rstrip('/')}/?app={version}"
 
 
 def desktop_quote(value: str) -> str:
@@ -118,7 +125,7 @@ class Launcher:
         # Never send localhost readiness requests through a configured HTTP proxy.
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
-            with opener.open(f"http://{HOST}:{port}/health", timeout=0.5) as response:
+            with opener.open(f"http://{LOCAL_HOST}:{port}/health", timeout=0.5) as response:
                 data = json.loads(response.read(8192))
             return (isinstance(data, dict) and data.get("status") == "ok" and data.get("app") == "YouPhonium"
                     and data.get("project_id") == project_id(self.root))
@@ -132,7 +139,7 @@ class Launcher:
         for port in PORTS:
             with socket.socket() as sock:
                 try:
-                    sock.bind((HOST, port))
+                    sock.bind((BIND_HOST, port))
                     return port
                 except OSError:
                     continue
@@ -214,7 +221,7 @@ class Launcher:
                 if self.cancel.is_set():
                     raise Cancelled()
                 if port is not None:
-                    self.url = f"http://{HOST}:{port}"
+                    self.url = f"http://{LOCAL_HOST}:{port}"
                     self.publish("existing", self.url)
                     return
                 try:
@@ -244,11 +251,11 @@ class Launcher:
                 if self.cancel.is_set():
                     raise Cancelled()
                 port = self.free_port()
-                self.url = f"http://{HOST}:{port}"
+                self.url = f"http://{LOCAL_HOST}:{port}"
                 self.publish("status", "Starting YouPhonium…")
                 log.write(f"\n--- Starting YouPhonium on {self.url} {time.ctime()} ---\n")
                 process = self.spawn([str(self.python), "-m", "uvicorn", "main:app", "--app-dir",
-                                      str(self.root / "backend"), "--host", HOST, "--port", str(port)], log)
+                                      str(self.root / "backend"), "--host", BIND_HOST, "--port", str(port)], log)
                 deadline = time.monotonic() + 120
                 while not self.cancel.is_set():
                     if process.poll() is not None:
@@ -278,146 +285,45 @@ class Launcher:
 
 
 def main():
+    """Run the local web app from a terminal; the terminal owns its server."""
     if sys.version_info < (3, 11):
         raise SystemExit("YouPhonium requires Python 3.11 or newer.")
-    import tkinter as tk
-    from tkinter import messagebox, ttk
 
-    window = tk.Tk()
-    window.title("YouPhonium")
-    window.minsize(540, 260)
-    frame = ttk.Frame(window, padding=24)
-    frame.pack(fill="both", expand=True)
-    ttk.Label(frame, text="YouPhonium", font=("sans-serif", 20, "bold")).pack(anchor="w")
-    status = tk.StringVar(value="Starting…")
-    ttk.Label(frame, textvariable=status, wraplength=490).pack(anchor="w", pady=(12, 8))
-    address = tk.StringVar()
-    ttk.Entry(frame, textvariable=address, state="readonly", width=56).pack(fill="x", pady=8)
-    progress = ttk.Progressbar(frame, mode="indeterminate")
-    progress.pack(fill="x", pady=8)
-    buttons = ttk.Frame(frame)
-    buttons.pack(fill="x", pady=8)
-    events = queue.Queue()
-    runner = Launcher(publish=lambda kind, text: events.put((kind, text)))
-    worker = None
-    closing = False
+    runner = Launcher()
 
-    def open_browser():
-        if not runner.url:
+    def publish(kind, text):
+        if kind == "error":
+            print(f"ERROR: {text}", file=sys.stderr, flush=True)
+            print(f"Log: {runner.log_path}", file=sys.stderr, flush=True)
             return
-        try:
-            opened = webbrowser.open(runner.url)
-        except (OSError, webbrowser.Error):
-            opened = False
-        if not opened:
-            messagebox.showinfo("Open YouPhonium", "Open this address in your browser:\n" + runner.url, parent=window)
-
-    def start(allow_setup=False):
-        nonlocal worker
-        if closing:
+        if kind in ("ready", "existing"):
+            print(f"YouPhonium is ready at {text}", flush=True)
+            try:
+                opened = webbrowser.open(versioned_app_url(text))
+            except (OSError, webbrowser.Error):
+                opened = False
+            if not opened:
+                print(f"Open this address in your browser: {text}", flush=True)
+            if kind == "ready":
+                print("Keep this Terminal window open. Press Ctrl+C to stop YouPhonium.", flush=True)
             return
-        if worker and worker.is_alive():
-            window.after(100, lambda: start(allow_setup))
-            return
-        start_button.config(state="disabled")
-        stop_button.config(state="normal")
-        browser_button.config(state="disabled")
-        runner.cancel.clear()
-        runner.url = None
-        address.set("")
-        status.set("Checking the app…")
-        progress.start(15)
-        worker = threading.Thread(target=runner.run, args=(allow_setup,), daemon=True)
-        worker.start()
+        print(text, flush=True)
 
-    def stop():
-        stop_button.config(state="disabled")
-        browser_button.config(state="disabled")
+    runner.publish = publish
+
+    def request_stop(*_):
         runner.cancel.set()
-        status.set("Stopping…")
-        threading.Thread(target=runner.stop, daemon=True).start()
 
-    def shortcut():
-        try:
-            target = install_shortcut()
-            location = (f"Open this shortcut in Finder, or drag it to your Dock:\n{target}\n\n"
-                        if sys.platform == "darwin" else "You can now launch YouPhonium from your Applications menu.\n\n")
-            messagebox.showinfo("Shortcut added", location + "Keep this project folder in its current location.", parent=window)
-        except (OSError, ValueError) as exc:
-            messagebox.showerror("Cannot add shortcut", str(exc), parent=window)
-
-    start_button = ttk.Button(buttons, text="Start", command=start)
-    start_button.pack(side="left")
-    browser_button = ttk.Button(buttons, text="Open browser", command=open_browser, state="disabled")
-    browser_button.pack(side="left", padx=8)
-    stop_button = ttk.Button(buttons, text="Stop", command=stop)
-    stop_button.pack(side="left")
-    ttk.Button(buttons, text="Add to Applications", command=shortcut).pack(side="right")
-    ttk.Label(frame, text="Keep this window open while using the app. Closing it stops the server you started.", wraplength=490).pack(anchor="w", pady=(8, 0))
-
-    def close():
-        nonlocal closing
-        closing = True
-        stop()
-
-    exit_requested = threading.Event()
-
-    def poll():
-        if exit_requested.is_set() and not closing:
-            close()
-        while not events.empty():
-            kind, text = events.get_nowait()
-            if closing:
-                continue
-            if kind == "status":
-                status.set(text)
-            elif kind == "setup":
-                progress.stop()
-                if messagebox.askyesno("Prepare YouPhonium", text, parent=window):
-                    start(True)
-                else:
-                    status.set("Setup cancelled. Click Start whenever you are ready.")
-                    start_button.config(state="normal")
-                    stop_button.config(state="disabled")
-            elif kind in ("ready", "existing"):
-                progress.stop()
-                address.set(text)
-                status.set("YouPhonium is ready. Opening your browser…" if kind == "ready"
-                           else "An existing YouPhonium server is running. This window will not stop it.")
-                browser_button.config(state="normal")
-                stop_button.config(state="normal" if kind == "ready" else "disabled")
-                start_button.config(state="disabled" if kind == "ready" else "normal")
-                open_browser()
-            elif kind in ("error", "stopped"):
-                progress.stop()
-                status.set(text)
-                start_button.config(state="normal")
-                stop_button.config(state="disabled")
-                browser_button.config(state="disabled")
-                if kind == "error":
-                    messagebox.showerror("YouPhonium could not start", text + "\n\nLog: " + str(runner.log_path), parent=window)
-        if closing and (not worker or not worker.is_alive()):
-            window.destroy()
-            return
-        if worker and not worker.is_alive() and status.get() == "Stopping…":
-            status.set("YouPhonium stopped.")
-            start_button.config(state="normal")
-            progress.stop()
-        window.after(100, poll)
-
-    window.protocol("WM_DELETE_WINDOW", close)
-    if window.tk.call("tk", "windowingsystem") == "aqua":
-        # macOS's application menu / Command-Q must use the same cleanup as Stop.
-        window.createcommand("tk::mac::Quit", close)
-    window.after(100, start)
-    window.after(100, poll)
-    # Finder .command files run through Terminal. Handle its hangup / Ctrl+C,
-    # too, so closing Terminal cannot leave our detached server running.
     previous_handlers = {}
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        previous_handlers[sig] = signal.signal(sig, lambda *_: exit_requested.set())
+        previous_handlers[sig] = signal.signal(sig, request_stop)
+
+    print("Starting YouPhonium…", flush=True)
     try:
-        window.mainloop()
+        # This is a personal launcher: first-time setup proceeds without a GUI prompt.
+        runner.run(allow_setup=True)
+    except KeyboardInterrupt:
+        runner.cancel.set()
     finally:
         runner.stop()
         for sig, handler in previous_handlers.items():

@@ -24,7 +24,11 @@ from .omr_layout import parse_omr_layout, parse_omr_note_positions
 from .recognition_quality import analyze_musicxml, quality_cost, read_musicxml
 from .score_image import prepare_score_image, load_score_image
 from .audiveris_recovery import prepare_wedge_recovery
-from .source_layout import preserve_source_layout
+from .source_layout import (
+    preserve_source_layout,
+    normalize_compact_multiple_rests,
+    continue_measure_numbers_across_pages,
+)
 
 AUDIVERIS_NAMES = ("audiveris", "Audiveris")
 
@@ -714,12 +718,16 @@ def _audiveris_image(image_path: Path, work_dir: Path, on_progress=None) -> Path
 
 
 def _save_recognition_report(source: Path, destination: Path) -> None:
+    export_warnings = normalize_compact_multiple_rests(destination)
+    export_warnings += continue_measure_numbers_across_pages(destination)
     projects = list(source.parent.glob("*.omr"))
     source_layout = preserve_source_layout(destination, projects[0]) if projects else None
     report = analyze_musicxml(destination)
     diagnostics = source.with_suffix(".diagnostics.json")
     if diagnostics.exists():
         report.update(json.loads(diagnostics.read_text(encoding="utf-8")))
+    if export_warnings:
+        report["export_warnings"] = report.get("export_warnings", []) + export_warnings
     if source_layout is not None:
         report["source_layout"] = source_layout
     destination.with_suffix(".recognition.json").write_text(

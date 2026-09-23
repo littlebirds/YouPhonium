@@ -4,7 +4,12 @@ import unittest
 import xml.etree.ElementTree as ET
 import zipfile
 
-from services.source_layout import preserve_source_layout, read_source_layout
+from services.source_layout import (
+    preserve_source_layout,
+    read_source_layout,
+    normalize_compact_multiple_rests,
+    continue_measure_numbers_across_pages,
+)
 from services.recognition_quality import read_musicxml
 
 try:
@@ -125,6 +130,80 @@ class SourceLayoutTests(unittest.TestCase):
         path = self.score(4)
         before = path.read_bytes()
         self.assertFalse(preserve_source_layout(path, self.project([[2, 2]], counts=[2, 1]))['preserved'])
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_compact_multiple_rest_gets_slots_before_following_notes(self):
+        path = self.score(9)
+        root = read_musicxml(path)
+        measure = root.find("./part/measure[@number='2']")
+        attributes = ET.Element('attributes')
+        style = ET.SubElement(attributes, 'measure-style')
+        ET.SubElement(style, 'multiple-rest').text = '8'
+        measure.insert(0, attributes)
+        for note in measure.findall('note'):
+            measure.remove(note)
+        path.write_bytes(ET.tostring(root))
+        pitches_before = [ET.tostring(n.find('pitch')) for n in root.iter('note')
+                          if n.find('pitch') is not None]
+
+        warnings = normalize_compact_multiple_rests(path)
+
+        repaired = read_musicxml(path)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('measure 2', warnings[0])
+        self.assertEqual(repaired.findtext('.//multiple-rest'), '8')
+        self.assertEqual([ET.tostring(n.find('pitch')) for n in repaired.iter('note')
+                          if n.find('pitch') is not None], pitches_before)
+        measures = repaired.findall('./part/measure')
+        self.assertEqual([m.get('number') for m in measures], [str(n) for n in range(1, 17)])
+        self.assertFalse(any(m.findall('note/pitch') for m in measures[1:9]))
+        self.assertTrue(all(m.find("note/rest[@measure='yes']") is not None for m in measures[1:9]))
+        self.assertTrue(measures[9].findall('note/pitch'))
+
+    def test_genuine_multiple_rest_is_preserved(self):
+        path = self.score(9)
+        root = read_musicxml(path)
+        measure = root.find("./part/measure[@number='2']")
+        attributes = ET.Element('attributes')
+        style = ET.SubElement(attributes, 'measure-style')
+        ET.SubElement(style, 'multiple-rest').text = '8'
+        measure.insert(0, attributes)
+        for later in root.findall('./part/measure')[1:9]:
+            for note in later.findall('note'):
+                pitch = note.find('pitch')
+                if pitch is not None:
+                    note.remove(pitch)
+                    note.insert(0, ET.Element('rest'))
+        path.write_bytes(ET.tostring(root))
+
+        self.assertEqual(normalize_compact_multiple_rests(path), [])
+        self.assertEqual(read_musicxml(path).findtext('.//multiple-rest'), '8')
+
+    def test_measure_numbers_continue_at_explicit_page_break(self):
+        path = self.score(6)
+        root = read_musicxml(path)
+        measures = root.findall('./part/measure')
+        for measure, number in zip(measures[3:], (1, 2, 3)):
+            measure.set('number', str(number))
+        measures[3].find('print').set('new-page', 'yes')
+        path.write_bytes(ET.tostring(root))
+
+        warnings = continue_measure_numbers_across_pages(path)
+
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(
+            [m.get('number') for m in read_musicxml(path).findall('./part/measure')],
+            ['1', '2', '3', '4', '5', '6'],
+        )
+
+    def test_duplicate_within_page_remains_visible_for_review(self):
+        path = self.score(4)
+        root = read_musicxml(path)
+        root.findall('./part/measure')[2].set('number', '2')
+        path.write_bytes(ET.tostring(root))
+        before = path.read_bytes()
+
+        self.assertEqual(continue_measure_numbers_across_pages(path), [])
         self.assertEqual(path.read_bytes(), before)
 
     @unittest.skipIf(verovio is None, 'Optional real Verovio engraving regression')

@@ -67,6 +67,7 @@ const context = {
     querySelectorAll() { return []; } },
   window: { location: { protocol: 'http:', origin: 'http://test.invalid' }, innerHeight: 700,
             addEventListener(name, callback) { windowEvents[name] = callback; },
+            confirm() { return true; },
             AudioContext: class { constructor() { this.state = 'running'; } resume() { return Promise.resolve(); } } },
   Soundfont: { instrument: async () => sounds },
   verovio: { module: {}, toolkit: Toolkit },
@@ -82,7 +83,7 @@ const context = {
 };
 let script = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
 // Expose only in the test VM, leaving the production closure unchanged.
-script = script.replace(/\}\)\(\);\s*$/, `globalThis.testApi = { setupTrackFromStoredData, handleFile, loadTrack, goToPage,
+script = script.replace(/\}\)\(\);\s*$/, `globalThis.testApi = { setupTrackFromStoredData, handleFile, loadTrack, deleteTrack, loadServerLibrary, goToPage,
   play, pause, stop, seekTo, onTempoChange, tick, resetInstrument: () => { instrument = null; },
   getPlaybackState: () => ({ isPlaying, playhead, tempo, trackLoading, currentTrackId, playlist }) }; })();`);
 vm.runInNewContext(script, context);
@@ -294,6 +295,42 @@ context.verovio.module.onRuntimeInitialized();
   context.testApi.tick();
   assert.equal(state().isPlaying, false);
   assert.equal(get('playbackCursor').hidden, true, 'Natural completion clears the marker');
+
+  // Shared-library deletion is permanent and must require explicit consent.
+  const beforeDelete = state().playlist.length;
+  state().playlist[0].libraryId = 'shared-score';
+  context.window.confirm = () => false;
+  context.testApi.deleteTrack(state().playlist[0].id);
+  assert.equal(state().playlist.length, beforeDelete, 'Cancel keeps the shared score');
+  let deletedUrl = null;
+  context.window.confirm = () => true;
+  context.fetch = async (url, request) => {
+    deletedUrl = url;
+    assert.equal(request.method, 'DELETE');
+    return { ok: true, text: async () => '{"success":true}' };
+  };
+  context.testApi.deleteTrack(state().playlist[0].id);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(deletedUrl, /\/library\/shared-score$/);
+  assert.equal(state().playlist.length, beforeDelete - 1, 'Confirmed delete removes the server-backed score');
+
+  // A new client builds its playlist from the server and loads score data lazily.
+  const sharedResult = {
+    success: true, library_id: 'server-item', filename: 'Shared Ballad.pdf', engine: 'homr',
+    musicxml_base64: 'PHNjb3JlLz4=', musicxml_format: 'xml', midi_base64: 'AA=='
+  };
+  context.fetch = async url => ({
+    ok: true,
+    text: async () => url.endsWith('/library')
+      ? JSON.stringify({ items: [{ id: 'server-item', filename: 'Shared Ballad.pdf', engine: 'homr' }] })
+      : JSON.stringify(sharedResult),
+  });
+  await context.testApi.loadServerLibrary();
+  assert.equal(state().playlist.length, 1);
+  assert.equal(state().playlist[0].filename, 'Shared Ballad — HOMR');
+  assert.equal(state().playlist[0].musicxmlBase64, null, 'Library listing remains lightweight');
+  await context.testApi.loadTrack(state().playlist[0].id);
+  assert.equal(state().playlist[0].musicxmlBase64, 'PHNjb3JlLz4=', 'Selecting fetches the stored score');
   console.log('PASS: visible chord highlights, latest-note cursor, rest/page transitions, pause/seek/resize/tempo, follow scrolling and cleanup');
   console.log('PASS: HOMR-only upload UI, recognized PNG/PDF view, engine provenance, layout, page navigation and downloads');
   console.log('PASS: failed rendering/MIDI/audio retain reviewable results; upload locking and playlist selection');

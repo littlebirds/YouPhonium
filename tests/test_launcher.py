@@ -54,9 +54,9 @@ class LauncherTests(unittest.TestCase):
                                           ("stopped", "YouPhonium stopped.")])
         args, kwargs = self.popen.call_args
         self.assertEqual(args[0], [str(self.runner.python), "-m", "uvicorn", "main:app",
-                                  "--app-dir", str(self.root / "backend"), "--host",
-                                  "127.0.0.1", "--port", "8004"])
-        self.assertEqual(kwargs["cwd"], self.root)
+                                  "--app-dir", str((self.root / "backend").resolve()), "--host",
+                                  "0.0.0.0", "--port", "8004"])
+        self.assertEqual(kwargs["cwd"].resolve(), self.root.resolve())
         self.assertTrue(kwargs["start_new_session"])
         self.kill.assert_called_once_with(self.process.pid, signal.SIGTERM)
         self.assertIsNone(self.runner.process)
@@ -75,9 +75,9 @@ class LauncherTests(unittest.TestCase):
         with patch.object(self.runner, "command") as command:
             self.runner.run(allow_setup=True)
         commands = [call.args[0] for call in command.call_args_list]
-        self.assertEqual(commands[0], [sys.executable, "-m", "venv", str(self.root / "backend/venv")])
+        self.assertEqual(commands[0], [sys.executable, "-m", "venv", str((self.root / "backend/venv").resolve())])
         self.assertIn("pip", commands[1])
-        self.assertEqual(commands[1][-2:], ["-r", str(self.root / "backend/requirements.txt")])
+        self.assertEqual(commands[1][-2:], ["-r", str((self.root / "backend/requirements.txt").resolve())])
         self.assertEqual(commands[2], [str(self.runner.python.parent / "homr"), "--init"])
         self.assertEqual((self.runner.state_dir / "setup-complete").read_text(), "installed")
         self.assertEqual(self.events[-1][0], "stopped")
@@ -170,7 +170,7 @@ class DiscoveryTests(unittest.TestCase):
             sock = socket.return_value.__enter__.return_value
             sock.bind.side_effect = [OSError("busy"), OSError("busy"), None]
             self.assertEqual(launch.Launcher().free_port(), 8002)
-            self.assertEqual(sock.bind.call_args.args[0], ("127.0.0.1", 8002))
+            self.assertEqual(sock.bind.call_args.args[0], ("0.0.0.0", 8002))
             sock.bind.side_effect = OSError("busy")
             with self.assertRaisesRegex(RuntimeError, "All app ports"):
                 launch.Launcher().free_port()

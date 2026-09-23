@@ -4,36 +4,29 @@ Upload a PDF or image of sheet music and play it in Euphonium sound (approximate
 
 ## Desktop launch (macOS)
 
-1. If you do not already have Python **3.11+** with Tkinter, install it using the
+1. If you do not already have Python **3.11+** with `venv`, install it using the
    [Python macOS installer](https://www.python.org/downloads/macos/). Python 3.13
-   is the version tested with this project. The standard installer includes Tkinter;
-   also double-click its **Install Certificates.command** in the Python folder
+   is the version tested with this project. Also double-click its
+   **Install Certificates.command** in the Python folder
    under Applications to enable secure downloads. See the
    [Python macOS installation guide](https://docs.python.org/3/using/mac.html).
 2. In Finder, double-click **Start YouPhonium.command** in this project folder.
-   Terminal may open, but you do not need to type any commands.
-3. Approve first-time setup in the launcher window. It **creates `backend/venv`
+   A Terminal window opens; you do not need to type any commands.
+3. First-time setup starts automatically. It **creates `backend/venv`
    if missing**, installs the backend requirements into it, and downloads missing
    HOMR models. Later launches reuse that environment and the downloaded models.
-4. The browser opens automatically when the server is ready. Optionally click
-   **Add to Applications** to create a local `.app` shortcut in your home folder's
-   `Applications` directory. Open that shortcut in Finder or add it to your Dock
-   for subsequent launches without Terminal.
+4. The browser opens automatically when the server is ready.
 
-Keep the launcher open while using the app. **Stop**, closing its window, or
-Command-Q stops the server it started. Closing the `.command` Terminal window
-also requests shutdown. Keep the project in its current location after creating
-the shortcut; recreate the shortcut if you move the project.
+Keep the Terminal window open while using the app. Press **Ctrl+C** or close the
+Terminal window to stop the server. Closing only the browser does not stop it.
 
 The launcher checks an existing project venv, your PATH, and standard Python.org
 and Homebrew locations on Apple Silicon and Intel Macs. It does not install
-Homebrew, modify Apple's Python, or require `sudo`. If Python/Tkinter is missing,
-it shows installation guidance. Advanced users can set `YOUPHONIUM_PYTHON` to a
+Homebrew, modify Apple's Python, or require `sudo`. If a usable Python is missing,
+it prints installation guidance. Advanced users can set `YOUPHONIUM_PYTHON` to a
 specific Python executable. Setup errors are saved to `.launcher/youphonium.log`.
 
-The `.app` is a local shortcut, not a signed, self-contained application bundle:
-Python and this project folder are still required. If macOS blocks opening a
-downloaded launcher, review the warning and use Apple's
+If macOS blocks opening a downloaded launcher, review the warning and use Apple's
 [instructions for opening trusted apps](https://support.apple.com/en-us/102445);
 do not disable security protections globally.
 
@@ -43,25 +36,25 @@ do not disable security protections globally.
    and choose **Run as a Program** (or double-click and choose **Run**, depending
    on your file manager). If needed, enable **Allow executing file as program**
    in the file's Properties / Permissions first.
-2. On first launch, approve setup. The launcher creates `backend/venv`, installs
+2. On first launch, setup starts automatically. The launcher creates `backend/venv`, installs
    the backend requirements, and downloads missing HOMR models. This can take
    several minutes and requires an internet connection; it does not use `sudo`
    or install Python packages system-wide.
-3. Your browser opens when the app is ready. Click **Add to Applications** in
-   the launcher to add YouPhonium to your desktop's Applications menu for future
-   launches. Keep the project folder in place; add the shortcut again if you move it.
+3. Your browser opens when the app is ready.
 
-Keep the launcher window open while using the app. **Stop** or closing that
-window stops the server it started; closing just the browser does not. A second
+Keep the launcher terminal open while using the app. Press **Ctrl+C** or close that
+terminal to stop the server it started; closing just the browser does not. A second
 launch reopens this project's running server without taking ownership of it.
-The launcher binds only to your computer (`127.0.0.1`) and chooses a free port
-from 8000–8009. It does not stop other apps occupying those ports.
+The launcher listens on the local network (`0.0.0.0`) and chooses a free port
+from 8000–8009. Other devices on the same trusted network can open
+`http://<this-computer's-LAN-IP>:<port>`. It does not stop other apps occupying
+those ports. Do not expose the port to the public internet.
 
-Python **3.11+**, Tkinter, and venv support must already be installed. On Debian,
-install `python3`, `python3-tk`, and `python3-venv` with your package manager
+Python **3.11+** and venv support must already be installed. On Debian,
+install `python3` and `python3-venv` with your package manager
 (or ask whoever manages the computer to do so). Subsequent launches reuse the
-environment and models; changed requirements prompt for setup again. Status and
-errors appear in the launcher, with details in `.launcher/youphonium.log`.
+environment and models; changed requirements trigger setup again. Status and
+errors appear in the terminal, with details in `.launcher/youphonium.log`.
 
 ## Prerequisites (manual setup)
 
@@ -108,7 +101,7 @@ From the `backend` directory:
 
 ```bash
 source venv/bin/activate
-python -m uvicorn main:app --host 127.0.0.1 --port 8000
+python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 Then open [http://localhost:8000](http://localhost:8000) in your browser.
@@ -172,6 +165,13 @@ without the affected hairpin. Any removed expression mark is disclosed in the
 review report; notes are not rewritten. MusicXML, a `.recognition.json` report,
 and editable `.omr` projects are kept in `omr_output/` (including `.original.omr`
 when export recovery was needed).
+
+The playlist is a shared view of `omr_output/`, so scores remain available to
+every client after a refresh or server restart. New uploads are identified by
+their original filename plus a SHA-256 content hash. Exact repeats reuse the
+existing recognition; different files with the same name receive a short hash
+suffix. Deleting a playlist item after confirmation removes its generated score
+and report files from the server.
 
 Regression checks:
 

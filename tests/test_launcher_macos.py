@@ -26,8 +26,6 @@ class MacLauncherTests(unittest.TestCase):
         self.bin.mkdir()
         self.environment = {**os.environ, "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin")}
         self.environment.pop("YOUPHONIUM_PYTHON", None)
-        # Never show a real installation dialog while running tests on macOS.
-        self.make_script(self.bin / "osascript", "printf 'installation guidance shown\\n'\n")
         # A separate path avoids macOS's deliberately excluded /usr/bin/python3
         # stub, even when this test host uses that path for its real Python.
         self.python = self.make_script(self.bin / "selected Python", f"exec {shlex.quote(sys.executable)} \"$@\"\n")
@@ -65,7 +63,7 @@ class MacLauncherTests(unittest.TestCase):
         self.make_script(self.bin / "python3.12", f"exec {shlex.quote(sys.executable)} \"$@\"\n")
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["script"], str(self.root / "launch.py"))
+        self.assertEqual(Path(json.loads(result.stdout)["script"]).resolve(), (self.root / "launch.py").resolve())
 
     def test_missing_explicit_python_reports_how_to_install_it(self):
         self.environment["YOUPHONIUM_PYTHON"] = str(self.root / "not installed")
@@ -73,14 +71,13 @@ class MacLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("Python 3.11", result.stderr)
         self.assertIn("Install Certificates.command", result.stderr)
-        self.assertIn("installation guidance shown", result.stdout)
 
     def test_python_without_required_modules_is_rejected(self):
         python = self.make_script(self.bin / "incomplete-python", "exit 1\n")
         self.environment["YOUPHONIUM_PYTHON"] = str(python)
         result = self.run_script()
         self.assertEqual(result.returncode, 1)
-        self.assertIn("Tkinter and venv", result.stderr)
+        self.assertIn("venv support", result.stderr)
 
     def test_app_shortcut_metadata_permissions_quoting_and_launch(self):
         applications = self.root / "Applications"
@@ -97,7 +94,7 @@ class MacLauncherTests(unittest.TestCase):
         self.environment["YOUPHONIUM_PYTHON"] = str(self.python)
         result = self.run_script(entry)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["script"], str(self.root / "launch.py"))
+        self.assertEqual(Path(json.loads(result.stdout)["script"]).resolve(), (self.root / "launch.py").resolve())
 
     def test_app_shortcut_defaults_to_user_applications(self):
         with patch.object(launch.sys, "platform", "darwin"), patch.object(launch.Path, "home", return_value=self.root):

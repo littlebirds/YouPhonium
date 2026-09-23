@@ -22,6 +22,7 @@ import base64
 import hashlib
 import json
 import logging
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -91,6 +92,125 @@ async def lifespan(app: FastAPI):
 
 # In-memory job storage: job_id -> { status, message, result?, error? }
 _upload_jobs: dict[str, dict] = {}
+_library_write_lock = threading.Lock()
+
+
+def _library_dir() -> Path:
+    path = Path(__file__).resolve().parent.parent / "omr_output"
+    path.mkdir(exist_ok=True)
+    return path
+
+
+def _library_id(path: Path) -> str:
+    return hashlib.sha256(path.name.encode("utf-8")).hexdigest()[:24]
+
+
+def _library_scores() -> list[Path]:
+    directory = _library_dir()
+    return sorted(
+        (path for path in directory.iterdir()
+         if path.is_file() and path.suffix.lower() in (".musicxml", ".mxl", ".xml")),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def _library_metadata(path: Path) -> dict:
+    metadata_path = path.with_suffix(".library.json")
+    if metadata_path.exists():
+        try:
+            return json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            log.warning("Ignoring invalid library metadata: %s", metadata_path)
+    return {}
+
+
+def _library_path(item_id: str) -> Path:
+    path = next((candidate for candidate in _library_scores()
+                 if _library_id(candidate) == item_id), None)
+    if path is None:
+        raise HTTPException(404, "Music not found")
+    return path
+
+
+def _safe_upload_name(filename: str) -> str:
+    return Path(filename.replace("\\", "/")).name or "score"
+
+
+def _find_duplicate(filename: str, source_sha256: str, engine: str) -> Optional[Path]:
+    safe_name = _safe_upload_name(filename)
+    for path in _library_scores():
+        metadata = _library_metadata(path)
+        if (metadata.get("original_filename") == safe_name
+                and metadata.get("source_sha256") == source_sha256
+                and metadata.get("engine") == engine):
+            return path
+    return None
+
+
+def _hashed_output_name(filename: str, source_sha256: str, engine: str) -> str:
+    """Return a stable collision-resistant source name for the OMR service."""
+    safe_name = _safe_upload_name(filename)
+    source = Path(safe_name)
+    stem = source.stem or "score"
+    suffix = source.suffix
+    token = source_sha256[:8]
+    engine_suffix = "" if engine == "homr" else f"--{engine}"
+    base = f"{stem}--{token}{engine_suffix}"
+    candidate = base
+    number = 2
+    existing_stems = {path.stem for path in _library_scores()}
+    while candidate in existing_stems:
+        candidate = f"{base}-{number}"
+        number += 1
+    return f"{candidate}{suffix}"
+
+
+def _write_library_metadata(path: Path, filename: str, source_sha256: str, engine: str) -> None:
+    if not path.exists() or path.parent != _library_dir():
+        return
+    metadata = {
+        "original_filename": _safe_upload_name(filename),
+        "source_sha256": source_sha256,
+        "engine": engine,
+        "created_at": time.time(),
+    }
+    path.with_suffix(".library.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
+def _result_from_musicxml(path: Path, filename: Optional[str] = None,
+                          engine: Optional[str] = None) -> dict:
+    metadata = _library_metadata(path)
+    filename = filename or metadata.get("original_filename") or path.name
+    engine = engine or metadata.get("engine")
+    report_path = path.with_suffix(".recognition.json")
+    recognition_report = (json.loads(report_path.read_text(encoding="utf-8"))
+                          if report_path.exists() else analyze_musicxml(path))
+    midi_bytes = b""
+    playback_error = None
+    try:
+        midi_bytes = musicxml_to_midi(path)
+    except (ValueError, RuntimeError) as exc:
+        playback_error = str(exc)
+    return {
+        "success": True,
+        "library_id": _library_id(path),
+        "engine": engine,
+        "midi_base64": base64.b64encode(midi_bytes).decode("ascii"),
+        "playback_error": playback_error,
+        "musicxml_base64": base64.b64encode(path.read_bytes()).decode("ascii"),
+        "musicxml_format": "mxl" if path.suffix.lower() == ".mxl" else "xml",
+        "filename": filename,
+        "recognition_report": recognition_report,
+        "measures_per_first_system": get_measures_per_first_system(path),
+        "measures_per_line": get_measures_per_system_for_layout(path),
+        "measure_boundaries": get_measure_boundaries(path),
+        "system_time_ranges": get_system_time_ranges(path),
+        "system_regions": get_system_regions(path),
+        "measure_layout_positions": get_measure_layout_positions(path),
+        "measure_note_positions": [],
+        "musicxml_path": str(path.resolve()),
+    }
 
 app = FastAPI(title="YouPhonium API", lifespan=lifespan)
 
@@ -101,6 +221,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def prevent_stale_app_shell(request, call_next):
+    """Always revalidate the small app shell so frontend updates take effect."""
+    response = await call_next(request)
+    if request.url.path in ("/", "/index.html", "/app.js", "/styles.css"):
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+    return response
 
 
 @app.get("/health")
@@ -209,8 +339,25 @@ def _run_upload_job(
             log.info("[Upload %s] %s", job_id[:8], msg)
 
         log.info("[Upload %s] Job started for %s (engine=%s, is_image=%s)", job_id[:8], filename, engine or "auto", is_image)
-        on_progress("Starting OMR…")
-        result = _recognize_upload(file_path, filename, filename, engine, is_image, on_progress)
+        source_sha256 = hashlib.sha256(file_path.read_bytes()).hexdigest()
+        # Keep the duplicate check and publication atomic. OMR is already a
+        # serialized workload; this also prevents simultaneous identical
+        # uploads from both writing the same hash-derived output name.
+        with _library_write_lock:
+            duplicate = _find_duplicate(filename, source_sha256, engine)
+            if duplicate is not None:
+                on_progress("Using existing recognition…")
+                result = _result_from_musicxml(duplicate, filename, engine)
+                result["deduplicated"] = True
+            else:
+                on_progress("Starting OMR…")
+                stored_filename = _hashed_output_name(filename, source_sha256, engine)
+                result = _recognize_upload(
+                    file_path, filename, stored_filename, engine, is_image, on_progress)
+                result_path = Path(result["musicxml_path"])
+                _write_library_metadata(result_path, filename, source_sha256, engine)
+                result["library_id"] = _library_id(result_path)
+                result["deduplicated"] = False
         job["status"] = "complete"
         job["message"] = "Complete"
         job["result"] = result
@@ -299,6 +446,48 @@ def upload_status(job_id: str):
     if job["status"] == "error" and job.get("error"):
         out["error"] = job["error"]
     return out
+
+
+@app.get("/library")
+def list_library():
+    """List the server's shared recognized-score library."""
+    items = []
+    for path in _library_scores():
+        metadata = _library_metadata(path)
+        original = metadata.get("original_filename") or path.name
+        items.append({
+            "id": _library_id(path),
+            "filename": original,
+            "engine": metadata.get("engine"),
+            "updated_at": path.stat().st_mtime,
+        })
+    return {"items": items}
+
+
+@app.get("/library/{item_id}")
+def get_library_item(item_id: str):
+    """Load notation, playback, and review data for one shared score."""
+    return _result_from_musicxml(_library_path(item_id))
+
+
+@app.delete("/library/{item_id}")
+def delete_library_item(item_id: str):
+    """Permanently delete a recognized score and its generated sidecars."""
+    path = _library_path(item_id)
+    removed = []
+    companions = [
+        path,
+        path.with_suffix(".recognition.json"),
+        path.with_suffix(".library.json"),
+        path.with_suffix(".omr"),
+        path.with_suffix(".original.omr"),
+        path.with_suffix(".audiveris.log"),
+    ]
+    for companion in companions:
+        if companion.exists() and companion.parent == _library_dir():
+            companion.unlink()
+            removed.append(companion.name)
+    return {"success": True, "removed": removed}
 
 
 @app.post("/transcribe")

@@ -49,7 +49,6 @@
   const musicxmlDownload = document.getElementById("musicxmlDownload");
   const notationMessage = document.getElementById("notationMessage");
 
-  const MAX_PLAYLIST_SIZE = 20;
   let playlist = [];
   let currentTrackId = null;
   let playlistIdCounter = 0;
@@ -848,17 +847,49 @@
     });
   }
 
+  function displayTrackName(filename, engine) {
+    var name = (filename || "score").replace(/\.(pdf|png|jpg|jpeg|musicxml|mxl|xml)$/i, "");
+    if (ENGINE_LABELS[engine]) name += " — " + ENGINE_LABELS[engine];
+    return name;
+  }
+
+  function applyResultToTrack(track, data) {
+    track.libraryId = data.library_id || track.libraryId || null;
+    track.engine = data.engine || track.engine || null;
+    track.filename = displayTrackName(data.filename || track.sourceFilename || track.filename, track.engine);
+    track.sourceFilename = data.filename || track.sourceFilename || null;
+    track.midiBase64 = data.midi_base64 || "";
+    track.playbackError = data.playback_error || null;
+    track.musicxmlBase64 = data.musicxml_base64 || null;
+    track.musicxmlFormat = data.musicxml_format || null;
+    track.recognitionReport = data.recognition_report || null;
+    track.measuresPerFirstSystem = data.measures_per_first_system;
+    track.measuresPerLine = data.measures_per_line;
+    track.measureBoundaries = data.measure_boundaries || [];
+    track.systemTimeRanges = data.system_time_ranges || [];
+    track.systemRegions = data.system_regions || [];
+    track.measureLayoutPositions = data.measure_layout_positions || [];
+    track.measureNotePositions = data.measure_note_positions || [];
+    return track;
+  }
+
   function addToPlaylist(data, file) {
-    if (playlist.length >= MAX_PLAYLIST_SIZE) {
-      showError("Playlist is full. Remove a track to add more.");
-      return;
+    var existing = data.library_id && playlist.find(function (track) {
+      return track.libraryId === data.library_id;
+    });
+    if (existing) {
+      applyResultToTrack(existing, data);
+      currentTrackId = existing.id;
+      renderPlaylist();
+      return existing;
     }
-    var id = "track-" + (++playlistIdCounter);
-    var filename = file.name.replace(/\.(pdf|png|jpg|jpeg)$/i, "");
-    if (ENGINE_LABELS[data.engine]) filename += " — " + ENGINE_LABELS[data.engine];
+    var id = data.library_id ? "library-" + data.library_id : "track-" + (++playlistIdCounter);
+    var filename = displayTrackName(data.filename || file.name, data.engine);
     var track = {
       id: id,
       filename: filename,
+      sourceFilename: data.filename || file.name,
+      libraryId: data.library_id || null,
       engine: data.engine || null,
       midiBase64: data.midi_base64,
       playbackError: data.playback_error || null,
@@ -881,6 +912,17 @@
     return track;
   }
 
+  function ensureTrackData(track) {
+    if (track.musicxmlBase64 || !track.libraryId) return Promise.resolve(track);
+    var baseUrl = API_URL || window.location.origin;
+    return fetch(baseUrl + "/library/" + encodeURIComponent(track.libraryId))
+      .then(function (response) {
+        if (response.ok === false) throw new Error("The score is no longer available on the server.");
+        return response.text().then(function (body) { return JSON.parse(body); });
+      })
+      .then(function (data) { return applyResultToTrack(track, data); });
+  }
+
   function loadTrack(id, fromUpload) {
     if (trackLoading || (uploadBusy && !fromUpload)) return Promise.resolve(false);
     var track = playlist.find(function (t) { return t.id === id; });
@@ -893,7 +935,9 @@
     renderPlaylist();
     showStatus("Loading track…", "loading");
     playerSection.hidden = false;
-    return setupTrackFromStoredData(track).then(function () {
+    return ensureTrackData(track).then(function () {
+      return setupTrackFromStoredData(track);
+    }).then(function () {
       hideStatus();
       trackNameEl.textContent = track.filename;
       progressBar.style.width = "0%";
@@ -917,7 +961,7 @@
     });
   }
 
-  function deleteTrack(id) {
+  function removeTrackLocally(id) {
     if (trackLoading) return;
     var idx = playlist.findIndex(function (t) { return t.id === id; });
     if (idx < 0) return;
@@ -944,6 +988,51 @@
     } else {
       renderPlaylist();
     }
+  }
+
+  function deleteTrack(id) {
+    if (trackLoading) return;
+    var track = playlist.find(function (candidate) { return candidate.id === id; });
+    if (!track) return;
+    var confirmed = !window.confirm || window.confirm(
+      "Delete “" + track.filename + "” from the shared library? This cannot be undone."
+    );
+    if (!confirmed) return;
+    if (!track.libraryId) {
+      removeTrackLocally(id);
+      return;
+    }
+    var baseUrl = API_URL || window.location.origin;
+    fetch(baseUrl + "/library/" + encodeURIComponent(track.libraryId), { method: "DELETE" })
+      .then(function (response) {
+        if (!response.ok) throw new Error("Could not delete the score from the server.");
+        removeTrackLocally(id);
+      })
+      .catch(function (error) { showError(error.message || "Could not delete the score."); });
+  }
+
+  function loadServerLibrary() {
+    var baseUrl = API_URL || window.location.origin;
+    return fetch(baseUrl + "/library")
+      .then(function (response) {
+        if (response.ok === false) throw new Error("Could not load the shared library.");
+        return response.text().then(function (body) { return JSON.parse(body); });
+      })
+      .then(function (data) {
+        playlist = (data.items || []).map(function (item) {
+          return {
+            id: "library-" + item.id,
+            libraryId: item.id,
+            sourceFilename: item.filename,
+            filename: displayTrackName(item.filename, item.engine),
+            engine: item.engine || null,
+            midiBase64: "",
+            musicxmlBase64: null,
+          };
+        });
+        if (playlistSection) playlistSection.hidden = playlist.length === 0;
+        renderPlaylist();
+      });
   }
 
   function reorderTrack(id, direction) {
@@ -1038,6 +1127,10 @@
     .catch(function () {
       showError("Cannot reach the backend. Start it with: cd backend && python -m uvicorn main:app --port 8000");
     });
+
+  loadServerLibrary().catch(function (error) {
+    showError(error.message || "Could not load the shared music library.");
+  });
 
   function pollUploadStatus(jobId, file, pollInterval) {
     var baseUrl = API_URL || window.location.origin;
