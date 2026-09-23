@@ -60,6 +60,10 @@ errors appear in the terminal, with details in `.launcher/youphonium.log`.
 
 1. **Python 3.11+** – for the backend and HOMR
 2. **HOMR** – `pip install homr`. AI-based recognition; tested with HOMR 0.7.0 on Python 3.13. Included in the backend requirements.
+3. **Tesseract OCR** – used only to read volta labels and printed repeat counts
+   during geometry recovery. Install it with `brew install tesseract` on macOS
+   or your system package manager on Linux. Without it, repeat-dot detection
+   still runs and the review report explains that bracket labels were skipped.
 
 ### Recognition engine
 
@@ -163,7 +167,7 @@ result before relying on playback or practice scoring.
 
 Repeat and volta support must not assume that every repeated section plays only
 twice or that every ending applies to exactly one pass. Use one shared data model
-for manual correction, validation, playback, and future geometry-based
+for manual correction, validation, playback, and geometry-based
 recognition. Represent a volta as a measure span plus a set of passes, for
 example `{startMeasure: 12, endMeasure: 13, passes: [1, 2]}`. A bracket spanning
 several measures needs a start marker only on its first measure and a stop (or
@@ -189,6 +193,17 @@ Geometry-based repeat/volta recognition must:
 - support more than two passes and validate bracket pass sets against repeat
   counts; and
 - avoid interpreting a single combined ending as multiple overlapping brackets.
+
+The HOMR and oemer pipelines now run a conservative source-geometry pass before
+their temporary page images are discarded. It maps five-line staff systems to
+the MusicXML's encoded page/system order, ranks full-height measure barlines,
+recognizes paired repeat dots on either side, and traces volta horizontals and
+their closing hooks. Volta labels are OCR-normalized into one pass set, including
+comma-separated and ranged labels. Explicit repeat-count text such as `3x` is
+preserved; when exactly one backward repeat is paired with endings beyond pass
+2, the highest ending pass supplies the repeat count. Low-confidence or
+incompletely mapped pages are left unchanged and reported in
+`repeat_geometry.warnings` rather than guessed.
 
 Do not automatically merge independently entered endings merely because they
 start on the same measure: their closing measures may differ. The UI should

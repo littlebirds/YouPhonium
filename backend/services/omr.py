@@ -22,6 +22,7 @@ from typing import Callable, List, Optional, Tuple
 
 from .omr_layout import parse_omr_layout, parse_omr_note_positions
 from .recognition_quality import analyze_musicxml, quality_cost, read_musicxml
+from .repeat_geometry import recognize_repeat_geometry
 from .score_image import prepare_score_image, load_score_image
 from .audiveris_recovery import prepare_wedge_recovery
 from .source_layout import (
@@ -231,6 +232,35 @@ def _merge_musicxml(paths: List[Path], output_path: Path) -> None:
     merged.write("musicxml", fp=str(output_path))
 
 
+def _augment_repeat_geometry(musicxml_path: Path, images: List[Path]) -> None:
+    """Run conservative source-geometry recovery and retain its diagnostics."""
+    # Page-by-page engines commonly restart measure numbers at 1. Resolve that
+    # before marker edits, otherwise a page-2 detection can also mutate the
+    # same raw measure number on page 1.
+    numbering_warnings = continue_measure_numbers_across_pages(musicxml_path)
+    try:
+        result = recognize_repeat_geometry(musicxml_path, images)
+    except Exception as exc:
+        log.warning("[OMR] Repeat geometry recognition failed: %s", exc)
+        result = {"repeat_geometry": {"detections": [], "warnings": [str(exc)], "edit_count": 0}}
+    diagnostics_path = musicxml_path.with_suffix(".diagnostics.json")
+    diagnostics = {}
+    if diagnostics_path.exists():
+        try:
+            diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            diagnostics = {}
+    diagnostics.update(result)
+    if numbering_warnings:
+        diagnostics["export_warnings"] = list(dict.fromkeys(
+            list(diagnostics.get("export_warnings", [])) + numbering_warnings
+        ))
+    diagnostics_path.write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
+    count = len(result.get("repeat_geometry", {}).get("detections", []))
+    if count:
+        log.info("[OMR] Recovered %d repeat/volta geometry marker(s)", count)
+
+
 def run_omr_oemer(
     pdf_path: Path,
     output_dir: Path,
@@ -300,6 +330,7 @@ def _run_omr_on_images(
     log.info("[OMR] Merging %d MusicXML files", len(musicxml_paths))
     merged_path = output_dir / f"{stem}.musicxml"
     _merge_musicxml(musicxml_paths, merged_path)
+    _augment_repeat_geometry(merged_path, images)
     return merged_path
 
 
@@ -432,6 +463,7 @@ def run_omr_homr(
     _progress("Merging pages…")
     merged_path = output_dir / f"{pdf_path.stem}.musicxml"
     _merge_musicxml(musicxml_paths, merged_path)
+    _augment_repeat_geometry(merged_path, images)
     return merged_path
 
 
@@ -471,6 +503,7 @@ def run_omr_homr_from_images(
     _progress("Merging pages…")
     merged_path = output_dir / f"{stem}.musicxml"
     _merge_musicxml(musicxml_paths, merged_path)
+    _augment_repeat_geometry(merged_path, image_paths)
     return merged_path
 
 

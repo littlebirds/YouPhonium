@@ -47,7 +47,8 @@ def _remove_empty_barline(measure: ET.Element, barline: ET.Element) -> None:
         measure.remove(barline)
 
 
-def _edit_measure(measure: ET.Element, action: str, ending_number: str | None) -> bool:
+def _edit_measure(measure: ET.Element, action: str, ending_number: str | None,
+                  repeat_times: int | None = None) -> bool:
     if action.startswith("add_forward"):
         location, direction = "left", "forward"
     elif action.startswith("add_backward"):
@@ -58,11 +59,18 @@ def _edit_measure(measure: ET.Element, action: str, ending_number: str | None) -
     if direction:
         barline = _barline(measure, location)
         repeat = barline.find("repeat")
-        if repeat is not None and repeat.get("direction") == direction:
+        expected_times = str(repeat_times) if repeat_times and repeat_times > 2 else None
+        if (repeat is not None and repeat.get("direction") == direction
+                and (repeat_times is None or repeat.get("times") == expected_times)):
             return False
         if repeat is None:
             repeat = ET.SubElement(barline, "repeat")
         repeat.set("direction", direction)
+        if repeat_times is not None:
+            if expected_times:
+                repeat.set("times", expected_times)
+            else:
+                repeat.attrib.pop("times", None)
         return True
 
     if action.startswith("remove_") and action.endswith("_repeat"):
@@ -145,7 +153,7 @@ def _write_musicxml(path: Path, root: ET.Element) -> None:
 
 
 def edit_marker(path: Path, measure_number: str, action: str,
-                ending_number: str | None = None) -> int:
+                ending_number: str | None = None, repeat_times: int | None = None) -> int:
     """Apply an idempotent marker edit to matching measures in every part."""
     if action not in EDIT_ACTIONS:
         raise ValueError(f"Unsupported MusicXML edit: {action}")
@@ -159,7 +167,7 @@ def edit_marker(path: Path, measure_number: str, action: str,
     ]
     if not matches:
         raise ValueError(f"Measure {measure_number} was not found")
-    changed = sum(_edit_measure(measure, action, ending_number) for measure in matches)
+    changed = sum(_edit_measure(measure, action, ending_number, repeat_times) for measure in matches)
     if changed:
         _write_musicxml(path, root)
     return changed
@@ -172,6 +180,7 @@ def apply_marker_edits(path: Path, edits: list[dict], save: bool = False) -> tup
     for edit in edits:
         action = edit["action"]
         ending_number = edit.get("ending_number")
+        repeat_times = edit.get("repeat_times")
         if action not in EDIT_ACTIONS:
             raise ValueError(f"Unsupported MusicXML edit: {action}")
         if action.startswith("add_ending_") and not ending_number:
@@ -183,7 +192,10 @@ def apply_marker_edits(path: Path, edits: list[dict], save: bool = False) -> tup
         ]
         if not matches:
             raise ValueError(f"Measure {measure_number} was not found")
-        changed += sum(_edit_measure(measure, action, ending_number) for measure in matches)
+        changed += sum(
+            _edit_measure(measure, action, ending_number, repeat_times)
+            for measure in matches
+        )
     xml = _serialize_musicxml(root)
     if save and changed:
         _write_musicxml(path, root)

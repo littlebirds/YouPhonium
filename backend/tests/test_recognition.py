@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import json
 import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
@@ -11,6 +12,11 @@ from PIL import Image, ImageDraw
 
 from services.recognition_quality import analyze_musicxml, quality_cost, read_musicxml
 from services.musicxml_editor import edit_marker
+from services.repeat_geometry import (
+    normalize_ending_label,
+    parse_repeat_times,
+    recognize_repeat_geometry,
+)
 from services.score_image import prepare_score_image, staff_spacing, load_score_image
 from services.audiveris_recovery import prepare_wedge_recovery
 from services import omr
@@ -136,6 +142,95 @@ class RecognitionTests(unittest.TestCase):
         right_barline = read_musicxml(path).find(".//measure[@number='2']/barline[@location='right']")
         self.assertEqual([child.tag for child in right_barline], ["ending", "repeat"])
 
+    def test_geometry_recovers_combined_multi_pass_endings(self):
+        import cv2
+        import numpy as np
+
+        measures = "".join(
+            bar(pitched("C"), number, attributes=number == 1)
+            for number in range(1, 7)
+        )
+        path = self.xml(score(measures), "geometry.musicxml")
+        image_path = self.root / "geometry.png"
+        image = np.full((500, 1200), 255, dtype=np.uint8)
+        top, spacing = 250, 20
+        boundaries = [100, 267, 434, 601, 768, 935, 1100]
+        for line in range(5):
+            cv2.line(image, (boundaries[0], top + line * spacing),
+                     (boundaries[-1], top + line * spacing), 0, 2)
+        for x in boundaries[1:]:
+            cv2.line(image, (x, top), (x, top + 4 * spacing), 0, 2)
+        # Forward repeat at measure 3; backward repeat after measure 5.
+        cv2.line(image, (428, top), (428, top + 4 * spacing), 0, 5)
+        cv2.circle(image, (448, top + 30), 4, 0, -1)
+        cv2.circle(image, (448, top + 50), 4, 0, -1)
+        cv2.line(image, (941, top), (941, top + 4 * spacing), 0, 5)
+        cv2.circle(image, (920, top + 30), 4, 0, -1)
+        cv2.circle(image, (920, top + 50), 4, 0, -1)
+        # A combined 1,2 ending over measure 5 and a third ending over 6.
+        for start, end in ((768, 925), (945, 1100)):
+            cv2.line(image, (start, 180), (end, 180), 0, 3)
+            cv2.line(image, (start, 180), (start, 220), 0, 3)
+            cv2.line(image, (end, 180), (end, 220), 0, 3)
+        cv2.imwrite(str(image_path), image)
+
+        with patch("services.repeat_geometry._ocr_text",
+                   side_effect=["", "1, 2.", "3."]):
+            report = recognize_repeat_geometry(path, [image_path])
+
+        self.assertEqual(report["repeat_geometry"]["warnings"], [])
+        root = read_musicxml(path)
+        forward = root.find(".//measure[@number='3']/barline/repeat")
+        backward = root.find(".//measure[@number='5']/barline/repeat")
+        self.assertEqual(forward.get("direction"), "forward")
+        self.assertEqual((backward.get("direction"), backward.get("times")), ("backward", "3"))
+        ending_5 = root.findall(".//measure[@number='5']/barline/ending")
+        ending_6 = root.findall(".//measure[@number='6']/barline/ending")
+        self.assertEqual([(item.get("number"), item.get("type")) for item in ending_5],
+                         [("1,2", "start"), ("1,2", "stop")])
+        self.assertEqual([(item.get("number"), item.get("type")) for item in ending_6],
+                         [("3", "start"), ("3", "stop")])
+
+    def test_geometry_label_and_repeat_count_normalization(self):
+        self.assertEqual(normalize_ending_label("1, 2."), "1,2")
+        self.assertEqual(normalize_ending_label("1–3"), "1,2,3")
+        self.assertEqual(normalize_ending_label("2 & 4."), "2,4")
+        self.assertIsNone(normalize_ending_label("Fine"))
+        self.assertEqual(parse_repeat_times("3x"), 3)
+        self.assertEqual(parse_repeat_times("play 4 times"), 4)
+        self.assertIsNone(parse_repeat_times("2x"))
+
+    def test_geometry_edits_use_continuous_page_measure_numbers(self):
+        page_2_first = bar(pitched("E"), 1, attributes=False).replace(
+            ">", '><print new-page="yes"/>', 1
+        )
+        path = self.xml(score(
+            two_staff_bar(1)
+            + bar(pitched("D"), 2, attributes=False)
+            + page_2_first
+            + bar(pitched("F"), 2, attributes=False)
+        ))
+
+        def fake_recognition(target, _images):
+            numbers = [m.get("number") for m in read_musicxml(target).findall("./part/measure")]
+            self.assertEqual(numbers, ["1", "2", "3", "4"])
+            self.assertEqual(edit_marker(target, "3", "add_forward_repeat"), 1)
+            return {"repeat_geometry": {
+                "detections": [{"measure": "3", "kind": "forward_repeat", "page": 2}],
+                "warnings": [],
+                "edit_count": 1,
+            }}
+
+        with patch("services.omr.recognize_repeat_geometry", side_effect=fake_recognition):
+            omr._augment_repeat_geometry(path, [])
+
+        measures = read_musicxml(path).findall("./part/measure")
+        self.assertIsNone(measures[0].find("barline/repeat"))
+        self.assertEqual(measures[2].find("barline/repeat").get("direction"), "forward")
+        diagnostics = json.loads(path.with_suffix(".diagnostics.json").read_text())
+        self.assertEqual(diagnostics["repeat_geometry"]["detections"][0]["measure"], "3")
+        self.assertTrue(diagnostics["export_warnings"])
+
     def test_marker_removal_is_idempotent(self):
         path = self.xml(score(two_staff_bar(1)))
         self.assertEqual(edit_marker(path, "1", "add_forward_repeat"), 1)
@@ -144,6 +239,16 @@ class RecognitionTests(unittest.TestCase):
         self.assertEqual(edit_marker(path, "1", "remove_forward_repeat"), 0)
         with self.assertRaisesRegex(ValueError, "Measure 99 was not found"):
             edit_marker(path, "99", "add_backward_repeat")
+
+    def test_repeat_count_is_preserved_unless_explicitly_replaced(self):
+        path = self.xml(score(two_staff_bar(1)))
+        self.assertEqual(edit_marker(path, "1", "add_backward_repeat", repeat_times=4), 1)
+        repeat = read_musicxml(path).find(".//barline/repeat")
+        self.assertEqual(repeat.get("times"), "4")
+        self.assertEqual(edit_marker(path, "1", "add_backward_repeat"), 0)
+        self.assertEqual(read_musicxml(path).find(".//barline/repeat").get("times"), "4")
+        self.assertEqual(edit_marker(path, "1", "add_backward_repeat", repeat_times=3), 1)
+        self.assertEqual(read_musicxml(path).find(".//barline/repeat").get("times"), "3")
 
     def test_tuplets_dots_and_multiple_voices(self):
         triplet = '<time-modification><actual-notes>3</actual-notes><normal-notes>2</normal-notes></time-modification>'
