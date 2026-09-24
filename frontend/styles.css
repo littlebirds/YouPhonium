@@ -291,6 +291,34 @@ body {
   margin-bottom: 20px;
 }
 
+.btn-reseek {
+  min-height: 44px;
+  padding: 0 15px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface2);
+  color: var(--text);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.btn-reseek:hover:not(:disabled) { border-color: var(--accent); }
+.btn-reseek[aria-pressed="true"] {
+  border-color: var(--accent-light);
+  background: rgba(124, 58, 237, 0.18);
+  box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.12);
+  color: #ddd6fe;
+}
+
+.reseek-hint {
+  max-width: 260px;
+  color: var(--muted);
+  font-size: 0.76rem;
+  line-height: 1.25;
+}
+
+#verovioNotation.reseek-active { cursor: crosshair; }
+
 .tempo-control {
   display: flex;
   align-items: center;
@@ -703,6 +731,22 @@ body {
   height: 7px;
   background: #7c3aed;
   clip-path: polygon(0 0, 100% 0, 50% 100%);
+}
+
+.playback-cursor.reseek-awaiting {
+  animation: reseek-cursor-blink 1.8s ease-in-out infinite;
+}
+
+@keyframes reseek-cursor-blink {
+  0%, 42%, 100% { opacity: 1; }
+  58%, 84% { opacity: 0.16; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .playback-cursor.reseek-awaiting {
+    animation: none;
+    box-shadow: 0 0 0 4px rgba(124, 58, 237, 0.3);
+  }
 }
 
 .playback-legend { color: var(--muted); font-size: 0.8rem; }

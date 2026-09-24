@@ -14,6 +14,8 @@
   const playBtn = document.getElementById("playBtn");
   const pauseBtn = document.getElementById("pauseBtn");
   const stopBtn = document.getElementById("stopBtn");
+  const reseekBtn = document.getElementById("reseekBtn");
+  const reseekHint = document.getElementById("reseekHint");
   const tempoSlider = document.getElementById("tempoSlider");
   const tempoValueEl = document.getElementById("tempoValue");
   const progressBar = document.getElementById("progressBar");
@@ -81,6 +83,10 @@
   let startRealTime = 0;
   let rafId = null;
   let isPlaying = false;
+  let playbackStartPending = false;
+  let playRequestId = 0;
+  let audioNeedsWakeRecovery = false;
+  let reseekActive = false;
   let verovioTk = null;
   let verovioReady = null;
   let currentNotationPage = 1;
@@ -209,6 +215,32 @@
       }
     }
     return playbackSeconds;
+  }
+
+  function playbackTimeForNotation(notationSeconds, currentSeconds) {
+    var track = currentTrackForLayout;
+    var timeline = track && track.playbackTimeMap;
+    if (!timeline || !timeline.length) return notationSeconds;
+    var candidates = [];
+    for (var i = 0; i < timeline.length; i++) {
+      var segment = timeline[i];
+      var scoreLength = segment.score_end - segment.score_start;
+      if (scoreLength <= 0 || notationSeconds < segment.score_start
+          || notationSeconds >= segment.score_end) continue;
+      var progress = (notationSeconds - segment.score_start) / scoreLength;
+      candidates.push(segment.playback_start
+        + progress * (segment.playback_end - segment.playback_start));
+    }
+    if (!candidates.length) return notationSeconds;
+
+    // A written measure can occur more than once in expanded repeat playback.
+    // If the target could mean either direction, reseek means rewind: choose
+    // the latest strictly earlier occurrence before considering a future one.
+    var earlier = candidates.filter(function (candidate) {
+      return candidate < currentSeconds - 0.001;
+    });
+    if (earlier.length) return Math.max.apply(Math, earlier);
+    return Math.min.apply(Math, candidates);
   }
 
   function updateNotationView(followPlayback) {
@@ -576,6 +608,55 @@
     return audioContext;
   }
 
+  function wait(milliseconds) {
+    return new Promise(function (resolve) { setTimeout(resolve, milliseconds); });
+  }
+
+  function resumeWithTimeout(ac) {
+    return new Promise(function (resolve, reject) {
+      var timeoutId = setTimeout(function () {
+        reject(new Error("Audio did not resume"));
+      }, 2500);
+      Promise.resolve(ac.resume()).then(function (value) {
+        clearTimeout(timeoutId);
+        resolve(value);
+      }, function (error) {
+        clearTimeout(timeoutId);
+        reject(error);
+      });
+    });
+  }
+
+  function recoverAudioForPlayback() {
+    if (audioContext && audioContext.state === "closed") {
+      audioContext = null;
+      instrument = null;
+    }
+    return loadInstrument().then(function () {
+      var ac = ensureAudioContext();
+      if (!audioNeedsWakeRecovery && ac.state === "running") return ac;
+
+      // iOS can leave a context "interrupted", or even report "running"
+      // while its output remains silent after screen lock. A short
+      // suspend/resume cycle from the user's Play gesture recovers both cases.
+      var prepare = Promise.resolve();
+      if (audioNeedsWakeRecovery && typeof ac.suspend === "function") {
+        // Do not await suspend(): affected WebKit versions can leave audio
+        // state promises unresolved while the hardware session reconnects.
+        try {
+          var suspension = ac.suspend();
+          if (suspension && suspension.catch) suspension.catch(function () {});
+        } catch (error) { /* resume below remains the recovery attempt */ }
+        prepare = wait(250);
+      }
+      return prepare.then(function () { return resumeWithTimeout(ac); }).then(function () {
+        if (ac.state !== "running") throw new Error("Audio is still unavailable");
+        audioNeedsWakeRecovery = false;
+        return ac;
+      });
+    });
+  }
+
   function loadInstrument() {
     if (instrument) return Promise.resolve(instrument);
     const ac = ensureAudioContext();
@@ -641,29 +722,64 @@
       playBtn.disabled = false;
       pauseBtn.disabled = true;
       stopBtn.disabled = true;
+      updateReseekControl();
       clearVerovioHighlights();
     }
   }
 
-  function play() {
-    if (isPlaying || trackLoading || !instrument || !notes.length) return;
+  function beginPlayback() {
     if (playhead >= (scoreDuration > 0 ? scoreDuration : totalDuration)) {
       playhead = 0;
       lastPlayedIndex = 0;
     }
     clearPracticeFeedback();
-    ensureAudioContext().resume();
     hideError();
     isPlaying = true;
+    setReseekMode(false);
     playBtn.disabled = true;
     pauseBtn.disabled = false;
     stopBtn.disabled = false;
+    updateReseekControl();
     startRealTime = performance.now() - (playhead / tempo) * 1000;
     updateNotationView();
     rafId = requestAnimationFrame(tick);
   }
 
+  function play() {
+    if (isPlaying || playbackStartPending || trackLoading || !notes.length) {
+      return Promise.resolve(false);
+    }
+    var ac = ensureAudioContext();
+    if (instrument && ac.state === "running" && !audioNeedsWakeRecovery) {
+      beginPlayback();
+      return Promise.resolve(true);
+    }
+
+    var requestId = ++playRequestId;
+    playbackStartPending = true;
+    playBtn.disabled = true;
+    updateReseekControl();
+    return recoverAudioForPlayback().then(function () {
+      if (requestId !== playRequestId) return false;
+      beginPlayback();
+      return true;
+    }).catch(function () {
+      if (requestId !== playRequestId) return false;
+      showError("Audio could not resume after the interruption. Tap Play to try again.");
+      playBtn.disabled = false;
+      pauseBtn.disabled = true;
+      return false;
+    }).finally(function () {
+      if (requestId === playRequestId) {
+        playbackStartPending = false;
+        updateReseekControl();
+      }
+    });
+  }
+
   function pause() {
+    playRequestId++;
+    playbackStartPending = false;
     if (isPlaying) {
       var endTime = scoreDuration > 0 ? scoreDuration : totalDuration;
       playhead = Math.min(endTime, (performance.now() - startRealTime) / 1000 * tempo);
@@ -678,6 +794,13 @@
     playBtn.disabled = false;
     pauseBtn.disabled = true;
     stopBtn.disabled = false;
+    updateReseekControl();
+  }
+
+  function handlePlaybackInterruption() {
+    if (!audioContext) return;
+    audioNeedsWakeRecovery = true;
+    if (isPlaying || playbackStartPending) pause();
   }
 
   function stop() {
@@ -732,6 +855,84 @@
     seekTo(ratio * endTime);
   }
 
+  function updateReseekControl() {
+    if (!reseekBtn) return;
+    var available = hasVerovioScore && notes.length > 0 && !!instrument
+      && !playbackStartPending && !trackLoading;
+    reseekBtn.disabled = !available;
+    if (!available && reseekActive) setReseekMode(false);
+  }
+
+  function setReseekMode(active) {
+    var available = hasVerovioScore && notes.length > 0 && !!instrument && !isPlaying
+      && !playbackStartPending && !trackLoading;
+    reseekActive = !!active && available;
+    if (reseekBtn) reseekBtn.setAttribute("aria-pressed", reseekActive ? "true" : "false");
+    if (verovioNotation) verovioNotation.classList.toggle("reseek-active", reseekActive);
+    if (reseekHint) reseekHint.textContent = reseekActive
+      ? "Tap a note or position in the score. Playback stays paused."
+      : "Tap Reseek, then tap the score. Playback pauses automatically.";
+    if (playbackCursor) {
+      if (reseekActive) {
+        notationPageManuallySelected = false;
+        updateNotationView(false);
+        playbackCursor.classList.add("reseek-awaiting");
+      } else {
+        playbackCursor.classList.remove("reseek-awaiting");
+      }
+    }
+  }
+
+  function toggleReseekMode() {
+    if (!reseekBtn || reseekBtn.disabled) return;
+    if (reseekActive) {
+      setReseekMode(false);
+      return;
+    }
+    if (isPlaying) pause();
+    setReseekMode(true);
+  }
+
+  function reseekFromNotation(event) {
+    if (!reseekActive || isPlaying || !event.target
+        || typeof event.target.closest !== "function") return false;
+    var measure = event.target.closest("g.measure");
+    if (!measure) return false;
+    var track = currentTrackForLayout;
+    var measureNumber = measureNumberForGroup(measure);
+    var measureIndex = track && track.measureNumbers
+      ? track.measureNumbers.map(String).indexOf(String(measureNumber)) : -1;
+    var boundary = measureIndex >= 0 && track.measureBoundaries
+      ? track.measureBoundaries[measureIndex] : null;
+    if (!boundary) {
+      if (reseekHint) reseekHint.textContent = "That score position could not be mapped to playback.";
+      return true;
+    }
+
+    var notationSeconds = null;
+    var note = event.target.closest("g.note");
+    if (note && note.id && verovioTk && typeof verovioTk.getTimeForElement === "function") {
+      var noteMilliseconds = Number(verovioTk.getTimeForElement(note.id));
+      if (Number.isFinite(noteMilliseconds)) notationSeconds = noteMilliseconds / 1000;
+    }
+    if (notationSeconds == null) {
+      var rect = measure.getBoundingClientRect();
+      var pointerX = Number.isFinite(event.clientX) ? event.clientX : rect.left;
+      var ratio = rect.width > 0 ? (pointerX - rect.left) / rect.width : 0;
+      ratio = Math.max(0, Math.min(0.999999, ratio));
+      notationSeconds = boundary[0] + ratio * (boundary[1] - boundary[0]);
+    }
+
+    seekTo(playbackTimeForNotation(notationSeconds, playhead));
+    setReseekMode(false);
+    return true;
+  }
+
+  function handleNotationClick(event) {
+    if (reseekFromNotation(event)) return;
+    selectMeasureForEdit(event);
+  }
+
   function renderRecognitionReview(track, openWhenIssues) {
     if (!recognitionReview) return;
     var report = track && track.recognitionReport;
@@ -767,6 +968,7 @@
   }
 
   function setupTrackFromStoredData(track) {
+    setReseekMode(false);
     pendingMusicXmlEdits = [];
     selectedEditMeasure = null;
     pendingEndingStart = null;
@@ -864,6 +1066,7 @@
       notationSection.hidden = false;
       updatePageNav();
       playBtn.disabled = notes.length === 0;
+      updateReseekControl();
       recordBtn.disabled = !hasVerovioScore || notes.length === 0;
       stopRecordBtn.disabled = true;
       practiceHint.hidden = false;
@@ -874,8 +1077,11 @@
         showError(track.playbackError || "No playable notes found. The recognition result is still available for review.");
         return;
       }
-      return loadInstrument().catch(function (err) {
+      return loadInstrument().then(function () {
+        updateReseekControl();
+      }).catch(function (err) {
         playBtn.disabled = true;
+        updateReseekControl();
         showError("Playback unavailable: " + err.message + ". The recognition result is still available for review.");
       });
     });
@@ -1434,6 +1640,7 @@
     }).finally(function () {
       trackLoading = false;
       setUploadControlsDisabled(false);
+      updateReseekControl();
     });
   }
 
@@ -1562,6 +1769,7 @@
   playBtn.addEventListener("click", play);
   pauseBtn.addEventListener("click", pause);
   stopBtn.addEventListener("click", stop);
+  if (reseekBtn) reseekBtn.addEventListener("click", toggleReseekMode);
   tempoSlider.addEventListener("input", onTempoChange);
 
   if (recordBtn) recordBtn.addEventListener("click", startRecording);
@@ -1601,7 +1809,7 @@
   if (scoreEditorSave) scoreEditorSave.addEventListener("click", saveMusicXmlEdits);
   if (scoreEditorDragHandle) scoreEditorDragHandle.addEventListener("pointerdown", beginScoreEditorDrag);
   if (editMeasure) editMeasure.addEventListener("input", selectEnteredMeasureForEdit);
-  if (verovioNotation) verovioNotation.addEventListener("click", selectMeasureForEdit);
+  if (verovioNotation) verovioNotation.addEventListener("click", handleNotationClick);
   Array.from(document.querySelectorAll("[data-edit-action]")).forEach(function (button) {
     button.addEventListener("click", function () { applyMusicXmlEdit(button.dataset.editAction); });
   });
@@ -1616,6 +1824,17 @@
   window.addEventListener("scroll", function () {
     if (selectedEditMeasure) restoreEditMeasureSelection();
     else if (scoreEditor && !scoreEditor.hidden) positionScoreEditor(null);
+  });
+
+  // Mobile Safari interrupts Web Audio when the screen locks or the browser
+  // moves to the background. Freeze our own clock at the same time so waking
+  // cannot skip silent notes. Playback resumes only from a fresh Play gesture.
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) handlePlaybackInterruption();
+  });
+  window.addEventListener("pagehide", handlePlaybackInterruption);
+  window.addEventListener("pageshow", function (event) {
+    if (event.persisted && audioContext) audioNeedsWakeRecovery = true;
   });
 
   // Check backend on load (read body once to avoid "stream already read" error)

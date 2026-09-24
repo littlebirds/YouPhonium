@@ -39,6 +39,8 @@ assert.ok(!ids.has(removed), removed + ' is removed from the page');
 assert.doesNotMatch(html, /comparison\.js|pdf\.min\.js/);
 assert.doesNotMatch(html, /score-editor-heading|score-editor-help|<span>Selected measure<\/span>/);
 assert.match(html, /data-tooltip="Click a measure in the score or type its number/);
+assert.match(html, /id="reseekBtn"[^>]*>Reseek to \.\.\.<\/button>/);
+assert.match(html, /Tap Reseek, then tap the score\. Playback pauses automatically\./);
 const elements = new Map();
 const get = id => {
   if (!ids.has(id)) return null;
@@ -55,6 +57,25 @@ const operations = [];
 const midiInputs = [];
 let now = 0;
 const sounds = { stops: 0, played: [], stop() { this.stops++; }, play(...args) { this.played.push(args); } };
+const audioContexts = [];
+class TestAudioContext {
+  constructor() {
+    this.state = 'running';
+    this.resumeCalls = 0;
+    this.suspendCalls = 0;
+    audioContexts.push(this);
+  }
+  resume() {
+    this.resumeCalls++;
+    this.state = 'running';
+    return Promise.resolve();
+  }
+  suspend() {
+    this.suspendCalls++;
+    this.state = 'suspended';
+    return Promise.resolve();
+  }
+}
 class Toolkit {
   setOptions(value) { options.push(value); operations.push('options'); }
   loadData() { operations.push('load'); return !rendererFails; }
@@ -68,14 +89,14 @@ class Toolkit {
   getElementAttr(id) { return id === 'measure-71' ? { n: '71' } : {}; }
 }
 const context = {
-  document: { getElementById: get, createElement: element,
+  document: { hidden: false, getElementById: get, createElement: element,
     addEventListener(name, callback) { documentEvents[name] = callback; },
     removeEventListener(name, callback) { if (documentEvents[name] === callback) delete documentEvents[name]; },
     querySelectorAll() { return []; } },
   window: { location: { protocol: 'http:', origin: 'http://test.invalid' }, innerHeight: 700,
             addEventListener(name, callback) { windowEvents[name] = callback; },
             confirm() { return true; },
-            AudioContext: class { constructor() { this.state = 'running'; } resume() { return Promise.resolve(); } } },
+            AudioContext: TestAudioContext },
   Soundfont: { instrument: async () => sounds },
   verovio: { module: {}, toolkit: Toolkit },
   fetch: async () => ({ text: async () => '{"omr_homr":true}' }),
@@ -93,6 +114,7 @@ let script = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
 script = script.replace(/\}\)\(\);\s*$/, `globalThis.testApi = { setupTrackFromStoredData, handleFile, loadTrack, deleteTrack, loadServerLibrary, goToPage,
   play, pause, stop, seekTo, onTempoChange, tick, setScoreEditorOpen, applyMusicXmlEdit, validateCurrentScore,
   selectMeasureForEdit, saveMusicXmlEdits, discardMusicXmlEdits, notationTimeForPlayback,
+  playbackTimeForNotation,
   resetInstrument: () => { instrument = null; },
   getPlaybackState: () => ({ isPlaying, playhead, tempo, trackLoading, currentTrackId, playlist }) }; })();`);
 vm.runInNewContext(script, context);
@@ -192,6 +214,27 @@ context.verovio.module.onRuntimeInitialized();
   assert.equal(state().playhead, 1);
   context.testApi.pause();
   assert.equal(state().isPlaying, false);
+
+  // Locking an iPad suspends Web Audio and requestAnimationFrame. The app must
+  // preserve the playhead instead of counting the sleeping interval, then
+  // recover the context from the next explicit Play gesture.
+  context.testApi.play();
+  context.document.hidden = true;
+  documentEvents.visibilitychange();
+  assert.equal(state().isPlaying, false, 'Screen lock pauses playback');
+  const beforeSleep = state().playhead;
+  now += 60000;
+  context.document.hidden = false;
+  documentEvents.visibilitychange();
+  await context.testApi.play();
+  assert.equal(audioContexts[0].suspendCalls, 1, 'Wake recovery cycles the audio context');
+  assert.equal(audioContexts[0].resumeCalls, 1, 'Wake recovery resumes audio before playback');
+  now += 500;
+  context.testApi.tick();
+  assert.ok(Math.abs(state().playhead - (beforeSleep + 0.5)) < 0.001,
+    'Time spent asleep is not counted as playback');
+  context.testApi.pause();
+
   context.testApi.seekTo(2);
   get('tempoSlider').value = '1.5';
   context.testApi.onTempoChange();
@@ -365,6 +408,25 @@ context.verovio.module.onRuntimeInitialized();
   ];
   assert.equal(context.testApi.notationTimeForPlayback(4.25), 0.25,
     'Cursor time jumps back to the written repeat start on the second pass');
+  assert.equal(context.testApi.playbackTimeForNotation(0.5, 4.25), 0.5,
+    'An ambiguous repeated score position prefers the earlier playback occurrence');
+  context.testApi.seekTo(3);
+  context.testApi.play();
+  assert.equal(get('reseekBtn').disabled, false, 'Reseek remains available during playback');
+  get('reseekBtn').events.click();
+  assert.equal(state().isPlaying, false, 'Entering reseek mode pauses playback automatically');
+  assert.equal(get('reseekBtn')['aria-pressed'], 'true');
+  assert.equal(get('playbackCursor').hidden, false, 'Reseek mode reveals the current cursor');
+  assert.equal(get('playbackCursor').classList.contains('reseek-awaiting'), true,
+    'Reseek mode gives the cursor its slow-blink state');
+  const reseekMeasure = element();
+  reseekMeasure.id = 'measure-71';
+  reseekMeasure.rect = { left: 150, top: 210, width: 250, height: 150, bottom: 360 };
+  const reseekTarget = { closest(selector) { return selector === 'g.measure' ? reseekMeasure : null; } };
+  get('verovioNotation').events.click({ target: reseekTarget, clientX: 212.5 });
+  assert.equal(state().playhead, 0.5, 'Reseek rewinds through the repeat instead of choosing its future pass');
+  assert.equal(get('reseekBtn')['aria-pressed'], 'false');
+  assert.equal(get('playbackCursor').classList.contains('reseek-awaiting'), false);
   context.testApi.seekTo(0);
   assert.equal(held.classList.contains('playing'), true);
   assert.equal(first['data-playing'], '1');
