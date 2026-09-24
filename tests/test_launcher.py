@@ -151,6 +151,34 @@ class LauncherTests(unittest.TestCase):
 
 
 class DiscoveryTests(unittest.TestCase):
+    def test_lan_address_falls_back_to_macos_interface(self):
+        udp_socket = Mock()
+        udp_socket.__enter__ = Mock(return_value=udp_socket)
+        udp_socket.__exit__ = Mock(return_value=False)
+        udp_socket.connect.side_effect = OSError("no default route")
+        interface_results = [
+            Mock(returncode=1, stdout=""),
+            Mock(returncode=0, stdout="192.168.50.7\n"),
+        ]
+        with patch.object(launch.socket, "socket", return_value=udp_socket), \
+                patch.object(launch.socket, "getaddrinfo", return_value=[]), \
+                patch.object(launch.sys, "platform", "darwin"), \
+                patch.object(launch.subprocess, "run", side_effect=interface_results) as run:
+            self.assertEqual(launch.lan_ipv4_address(), "192.168.50.7")
+        self.assertEqual(run.call_args_list[0].args[0],
+                         ["/usr/sbin/ipconfig", "getifaddr", "en0"])
+        self.assertEqual(run.call_args_list[1].args[0],
+                         ["/usr/sbin/ipconfig", "getifaddr", "en1"])
+
+    def test_device_url_uses_route_selected_lan_address(self):
+        with patch.object(launch, "lan_ipv4_address", return_value="192.168.20.45"):
+            self.assertEqual(
+                launch.device_url("http://127.0.0.1:8004"),
+                "http://192.168.20.45:8004",
+            )
+        with patch.object(launch, "lan_ipv4_address", return_value=None):
+            self.assertIsNone(launch.device_url("http://127.0.0.1:8004"))
+
     def test_health_requires_success_and_matching_project_identity(self):
         runner = launch.Launcher()
         payload = {"status": "ok", "app": "YouPhonium", "project_id": launch.project_id(launch.ROOT)}

@@ -113,6 +113,19 @@ Press Ctrl+C in the terminal to stop it. For development, add
 `--reload --reload-exclude 'venv*/**'`. Matplotlib settings are applied automatically to
 avoid a font-manager hang on macOS.
 
+## HarmonyOS client
+
+The [`harmonyos`](harmonyos/README.md) directory contains a hybrid HarmonyOS
+phone/tablet client. It preserves the existing server-client architecture:
+HOMR recognition, score storage, MusicXML correction, and MIDI generation stay
+on this Python server, while an ArkWeb client connects over the trusted local
+network. The app stores the server's LAN URL and forwards native lifecycle
+events to the web player's audio-recovery logic.
+
+The launcher prints both a desktop URL (`127.0.0.1`) and, when available, a LAN
+URL for HarmonyOS and other devices. A simulator's `127.0.0.1` is the simulator
+itself, so enter the printed LAN URL in the HarmonyOS client.
+
 ## Usage
 
 1. Drag and drop a PDF, PNG, or JPEG onto the upload area, or click to browse.

@@ -33,6 +33,7 @@ class TerminalLauncherTests(unittest.TestCase):
 
         output = io.StringIO()
         with patch.object(launch, "Launcher", FakeLauncher), \
+                patch.object(launch, "lan_ipv4_address", return_value="192.168.1.20"), \
                 patch.object(launch.webbrowser, "open", return_value=True) as browser, \
                 redirect_stdout(output):
             launch.main()
@@ -43,6 +44,8 @@ class TerminalLauncherTests(unittest.TestCase):
         opened = browser.call_args.args[0]
         self.assertTrue(opened.startswith("http://127.0.0.1:8004/?app="), opened)
         self.assertIn("Press Ctrl+C", output.getvalue())
+        self.assertIn("HarmonyOS and other devices on this Wi-Fi: http://192.168.1.20:8004",
+                      output.getvalue())
 
 
 if __name__ == "__main__":

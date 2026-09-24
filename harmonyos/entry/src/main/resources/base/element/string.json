@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "Play and correct scores recognized by your YouPhonium server"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "YouPhonium"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "YouPhonium"
+    }
+  ]
+}

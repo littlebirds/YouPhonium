@@ -5,3 +5,10 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 .launcher/
+
+# DevEco Studio / HarmonyOS build products
+harmonyos/.hvigor/
+harmonyos/.idea/
+harmonyos/oh_modules/
+harmonyos/local.properties
+harmonyos/**/build/

@@ -1986,4 +1986,23 @@
         fileInput.value = "";
       });
   }
+
+  // Native clients host this same web application rather than duplicating its
+  // playback state. HarmonyOS calls these hooks through ArkWeb when the app
+  // changes lifecycle state. Keep them small and browser-safe so ordinary web
+  // clients continue to work exactly as before.
+  window.YouPhoniumApp = Object.freeze({
+    onHostBackground: function () {
+      handlePlaybackInterruption();
+      return JSON.stringify({ playing: isPlaying, playhead: playhead });
+    },
+    onHostForeground: function () {
+      if (audioContext) audioNeedsWakeRecovery = true;
+      return JSON.stringify({
+        playing: isPlaying,
+        playhead: playhead,
+        audioState: audioContext ? audioContext.state : "uninitialized",
+      });
+    },
+  });
 })();

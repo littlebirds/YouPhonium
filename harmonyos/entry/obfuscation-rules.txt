@@ -1,0 +1,2 @@
+# Keep the JavaScript-facing lifecycle entry points stable.
+-keep-global-name

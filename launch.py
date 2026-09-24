@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 
@@ -49,6 +50,57 @@ def versioned_app_url(url: str, root: Path = ROOT) -> str:
     script = root / "frontend/app.js"
     version = script.stat().st_mtime_ns if script.exists() else int(time.time_ns())
     return f"{url.rstrip('/')}/?app={version}"
+
+
+def lan_ipv4_address() -> str | None:
+    """Return the route-selected IPv4 address for clients on the local network."""
+    # UDP connect selects a route without sending application data. The TEST-NET
+    # destination need not be reachable; getsockname still reports the interface
+    # chosen by the OS. Hostname lookup is a fallback for offline networks.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("192.0.2.1", 9))
+            address = sock.getsockname()[0]
+            if address and not address.startswith("127."):
+                return address
+    except OSError:
+        pass
+    try:
+        candidates = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+    except OSError:
+        candidates = []
+    discovered = next((entry[4][0] for entry in candidates
+                       if entry[4] and not entry[4][0].startswith("127.")), None)
+    if discovered:
+        return discovered
+
+    # Hostname resolution is commonly loopback-only on macOS. Ask its network
+    # configuration tool for the usual Wi-Fi/Ethernet interfaces before giving
+    # up. Linux's hostname tool provides the equivalent final fallback.
+    commands = (["/usr/sbin/ipconfig", "getifaddr", interface]
+                for interface in ("en0", "en1", "en2")) if sys.platform == "darwin" else (
+                    (["hostname", "-I"],)
+                )
+    for command in commands:
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode:
+            continue
+        for address in result.stdout.split():
+            if address.count(".") == 3 and not address.startswith("127."):
+                return address
+    return None
+
+
+def device_url(local_url: str) -> str | None:
+    """Translate a loopback launcher URL into one reachable by another device."""
+    address = lan_ipv4_address()
+    parsed = urllib.parse.urlsplit(local_url)
+    if not address or parsed.port is None:
+        return None
+    return f"{parsed.scheme or 'http'}://{address}:{parsed.port}"
 
 
 def desktop_quote(value: str) -> str:
@@ -298,6 +350,12 @@ def main():
             return
         if kind in ("ready", "existing"):
             print(f"YouPhonium is ready at {text}", flush=True)
+            shared_url = device_url(text)
+            if shared_url:
+                print(f"HarmonyOS and other devices on this Wi-Fi: {shared_url}", flush=True)
+            else:
+                print("For another device, use this computer's Wi-Fi IP address instead of 127.0.0.1.",
+                      flush=True)
             try:
                 opened = webbrowser.open(versioned_app_url(text))
             except (OSError, webbrowser.Error):
